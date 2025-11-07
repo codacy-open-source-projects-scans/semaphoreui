@@ -19,7 +19,7 @@ func (d *BoltDb) CreateIntegration(integration db.Integration) (db.Integration, 
 	return newIntegration.(db.Integration), err
 }
 
-func (d *BoltDb) GetIntegrations(projectID int, params db.RetrieveQueryParams) (integrations []db.Integration, err error) {
+func (d *BoltDb) GetIntegrations(projectID int, params db.RetrieveQueryParams, includeTaskParams bool) (integrations []db.Integration, err error) {
 	err = d.getObjects(projectID, db.IntegrationProps, params, nil, &integrations)
 	return integrations, err
 }
@@ -68,7 +68,7 @@ func (d *BoltDb) CreateIntegrationExtractValue(projectId int, value db.Integrati
 func (d *BoltDb) GetIntegrationExtractValues(projectID int, params db.RetrieveQueryParams, integrationID int) (values []db.IntegrationExtractValue, err error) {
 	values = make([]db.IntegrationExtractValue, 0)
 
-	err = d.getObjects(projectID, db.IntegrationExtractValueProps, params, func(i interface{}) bool {
+	err = d.getObjects(projectID, db.IntegrationExtractValueProps, params, func(i any) bool {
 		v := i.(db.IntegrationExtractValue)
 		return v.IntegrationID == integrationID
 	}, &values)
@@ -111,7 +111,7 @@ func (d *BoltDb) CreateIntegrationMatcher(projectID int, matcher db.IntegrationM
 func (d *BoltDb) GetIntegrationMatchers(projectID int, params db.RetrieveQueryParams, integrationID int) (matchers []db.IntegrationMatcher, err error) {
 	matchers = make([]db.IntegrationMatcher, 0)
 
-	err = d.getObjects(projectID, db.IntegrationMatcherProps, db.RetrieveQueryParams{}, func(i interface{}) bool {
+	err = d.getObjects(projectID, db.IntegrationMatcherProps, db.RetrieveQueryParams{}, func(i any) bool {
 		v := i.(db.IntegrationMatcher)
 		return v.IntegrationID == integrationID
 	}, &matchers)
@@ -170,25 +170,4 @@ func (d *BoltDb) deleteIntegration(projectID int, integrationID int, tx *bbolt.T
 
 func (d *BoltDb) GetIntegrationMatcherRefs(projectID int, matcherID int, integrationID int) (db.IntegrationExtractorChildReferrers, error) {
 	return d.getIntegrationExtractorChildrenRefs(projectID, db.IntegrationMatcherProps, matcherID)
-}
-
-func (d *BoltDb) GetAllSearchableIntegrations() (integrations []db.Integration, err error) {
-	integrations = make([]db.Integration, 0)
-
-	projects, err := d.GetAllProjects()
-	if err != nil {
-		return
-	}
-
-	for _, project := range projects {
-		var projectIntegrations []db.Integration
-		projectIntegrations, err = d.GetIntegrations(project.ID, db.RetrieveQueryParams{})
-		if err != nil {
-			return
-		}
-
-		integrations = append(integrations, projectIntegrations...)
-	}
-
-	return
 }

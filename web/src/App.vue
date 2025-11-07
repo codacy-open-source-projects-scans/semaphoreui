@@ -31,25 +31,6 @@
     </YesNoDialog>
 
     <EditDialog
-      v-model="passwordDialog"
-      save-button-text="Save"
-      :title="$t('changePassword')"
-      v-if="user"
-      event-name="i-user"
-    >
-      <template v-slot:form="{ onSave, onError, needSave, needReset }">
-        <ChangePasswordForm
-          :project-id="projectId"
-          :item-id="user.id"
-          @save="onSave"
-          @error="onError"
-          :need-save="needSave"
-          :need-reset="needReset"
-        />
-      </template>
-    </EditDialog>
-
-    <EditDialog
       v-model="userDialog"
       save-button-text="Save"
       :title="$t('editUser')"
@@ -66,48 +47,63 @@
           :need-save="needSave"
           :need-reset="needReset"
           :is-admin="user.admin"
+          :auth-methods="(systemInfo || {auth_methods: {}}).auth_methods"
           @hide-action-buttons="hideUserDialogButtons = true"
           @show-action-buttons="hideUserDialogButtons = false"
         />
       </template>
     </EditDialog>
 
-    <EditDialog
+    <TaskLogDialog
       v-model="taskLogDialog"
-      :max-width="1000"
-      :hide-buttons="true"
-      :expandable="true"
-      name="TaskLogDialog"
       @close="onTaskLogDialogClosed()"
-    >
-      <template v-slot:title={}>
-        <div class="text-truncate" style="max-width: calc(100% - 36px);">
-          <router-link
-            class="breadcrumbs__item breadcrumbs__item--link"
-            :to="`/project/${projectId}/templates/${template ? template.id : null}`"
-            @click="taskLogDialog = false"
-          >{{ template ? template.name : null }}
-          </router-link>
-          <v-icon>mdi-chevron-right</v-icon>
-          <span class="breadcrumbs__item">{{ $t('task', {expr: task ? task.id : null}) }}</span>
-        </div>
-      </template>
-      <template v-slot:form="{}">
-        <TaskLogView :project-id="projectId" :item-id="task ? task.id : null"/>
-      </template>
-    </EditDialog>
+      :project-id="projectId"
+      :item-id="taskId"
+      :system-info="systemInfo"
+    />
 
     <EditDialog
       v-model="newProjectDialog"
       save-button-text="Create"
       :title="$t('newProject')"
       event-name="i-project"
+      @close="onNewProjectDialogueClosed()"
     >
       <template v-slot:form="{ onSave, onError, needSave, needReset }">
         <ProjectForm
           v-if="newProjectType === ''"
           item-id="new"
           @save="onSave"
+          @error="onError"
+          :need-save="needSave"
+          :need-reset="needReset"
+        />
+      </template>
+    </EditDialog>
+
+    <EditDialog
+      v-model="subscriptionDialog"
+      :save-button-text="null"
+      :cancel-button-text="$t('close')"
+      v-if="user"
+      event-name="i-user"
+      dont-close-on-save
+    >
+      <template v-slot:title="{}">
+        <v-icon
+          large
+          class="mr-2"
+          color="#f14668"
+        >
+          mdi-professional-hexagon
+        </v-icon>
+        Subscription details
+      </template>
+
+      <template v-slot:form="{ onSave, onError, needSave, needReset }">
+        <SubscriptionForm
+          item-id="new"
+          @save="onSave(); onSubscriptionKeyUpdates();"
           @error="onError"
           :need-save="needSave"
           :need-reset="needReset"
@@ -165,6 +161,7 @@
               class="app__project-selector"
               v-bind="attrs"
               v-on="on"
+              data-testid="sidebar-currentProject"
             >
               <v-list-item-icon>
                 <v-avatar
@@ -190,6 +187,7 @@
           </v-list>
         </template>
         <v-list>
+
           <v-list-item
             v-for="(item, i) in projects"
             :key="i"
@@ -208,9 +206,12 @@
             <v-list-item-content>{{ item.name }}</v-list-item-content>
           </v-list-item>
 
+          <v-divider v-if="user.can_create_project"/>
+
           <v-list-item
-            @click="newProjectDialog = true; newProjectType = '';"
+            @click="showNewProjectDialogue()"
             v-if="user.can_create_project"
+            data-testid="sidebar-newProject"
           >
             <v-list-item-icon>
               <v-icon>mdi-plus</v-icon>
@@ -221,7 +222,11 @@
             </v-list-item-content>
           </v-list-item>
 
-          <v-list-item @click="restoreProjectDialog = true" v-if="user.can_create_project">
+          <v-list-item
+            @click="restoreProjectDialog = true"
+            v-if="user.can_create_project"
+            data-testid="sidebar-restoreProject"
+          >
             <v-list-item-icon>
               <v-icon>mdi-backup-restore</v-icon>
             </v-list-item-icon>
@@ -243,10 +248,8 @@
             <v-list-item-title>{{ $t('newProject2') }}</v-list-item-title>
           </v-list-item-content>
         </v-list-item>
-      </v-list>
 
-      <v-list class="pt-0" v-if="!project">
-        <v-list-item key="new_project" :to="`/project/restore`">
+        <v-list-item key="restore_project" :to="`/project/restore`">
           <v-list-item-icon>
             <v-icon>mdi-restore</v-icon>
           </v-list-item-icon>
@@ -259,7 +262,11 @@
 
       <v-list class="pt-0" v-if="project">
 
-        <v-list-item key="dashboard" :to="`/project/${projectId}/history`">
+        <v-list-item
+          key="dashboard"
+          :to="`/project/${projectId}/history`"
+          data-testid="sidebar-dashboard"
+        >
           <v-list-item-icon>
             <v-icon>mdi-view-dashboard</v-icon>
           </v-list-item-icon>
@@ -269,7 +276,12 @@
           </v-list-item-content>
         </v-list-item>
 
-        <v-list-item v-if="project.type === ''" key="templates" :to="templatesUrl">
+        <v-list-item
+          v-if="project.type === ''"
+          key="templates"
+          :to="templatesUrl"
+          data-testid="sidebar-templates"
+        >
           <v-list-item-icon>
             <v-icon>mdi-check-all</v-icon>
           </v-list-item-icon>
@@ -283,6 +295,7 @@
           v-if="project.type === ''"
           key="schedule"
           :to="`/project/${projectId}/schedule`"
+          data-testid="sidebar-schedule"
         >
           <v-list-item-icon>
             <v-icon>mdi-clock-outline</v-icon>
@@ -297,6 +310,7 @@
           v-if="project.type === ''"
           key="inventory"
           :to="`/project/${projectId}/inventory`"
+          data-testid="sidebar-inventory"
         >
           <v-list-item-icon>
             <v-icon>mdi-monitor-multiple</v-icon>
@@ -311,6 +325,7 @@
           v-if="project.type === ''"
           key="environment"
           :to="`/project/${projectId}/environment`"
+          data-testid="sidebar-environment"
         >
           <v-list-item-icon>
             <v-icon>mdi-code-braces</v-icon>
@@ -325,6 +340,7 @@
           v-if="project.type === ''"
           key="keys"
           :to="`/project/${projectId}/keys`"
+          data-testid="sidebar-keys"
         >
           <v-list-item-icon>
             <v-icon>mdi-key-change</v-icon>
@@ -353,6 +369,7 @@
           v-if="project.type === ''"
           key="integrations"
           :to="`/project/${projectId}/integrations`"
+          data-testid="sidebar-integrations"
         >
           <v-list-item-icon>
             <v-icon>mdi-connection</v-icon>
@@ -363,7 +380,11 @@
           </v-list-item-content>
         </v-list-item>
 
-        <v-list-item key="team" :to="`/project/${projectId}/team`">
+        <v-list-item
+          key="team"
+          :to="`/project/${projectId}/team`"
+          data-testid="sidebar-team"
+        >
           <v-list-item-icon>
             <v-icon>mdi-account-multiple</v-icon>
           </v-list-item-icon>
@@ -379,23 +400,33 @@
 
           <v-list-item>
             <v-switch
+              class="DarkModeSwitch"
               v-model="darkMode"
-              inset
-              :label="$t('darkMode')"
-              persistent-hint
+              prepend-icon="mdi-white-balance-sunny"
+              append-icon="mdi-weather-night"
             ></v-switch>
 
             <v-spacer/>
 
-            <v-menu top min-width="150" max-width="235" nudge-top="12" :position-x="50" absolute>
+            <v-menu
+              top
+              min-width="150"
+              max-width="235"
+              nudge-top="12"
+              :position-x="50"
+              absolute
+            >
               <template v-slot:activator="{on, attrs}">
                 <v-btn
                   icon
-                  x-large
                   v-bind="attrs"
                   v-on="on"
                 >
-                  <span style="font-size: 30px;">{{ lang.flag }}</span>
+                  <img
+                    style="border-radius: 30px; max-width: 100%;"
+                    :src="`flags/${lang.flag}.svg`"
+                    alt=""
+                  />
                 </v-btn>
               </template>
 
@@ -407,7 +438,11 @@
                 >
 
                   <v-list-item-icon>
-                    {{ lang.flag }}
+                    <v-img
+                      style="border-radius: 20px; max-width: 24px;"
+                      :src="`flags/${lang.flag}.svg`"
+                      alt=""
+                    />
                   </v-list-item-icon>
 
                   <v-list-item-content>
@@ -428,7 +463,13 @@
                 v-on="on"
               >
                 <v-list-item-icon>
-                  <v-icon>mdi-account</v-icon>
+                  <v-icon
+                    color="#f14668"
+                    v-if="user.pro"
+                  >
+                    mdi-professional-hexagon
+                  </v-icon>
+                  <v-icon v-else>mdi-account</v-icon>
                 </v-list-item-icon>
 
                 <v-list-item-content>
@@ -455,15 +496,42 @@
                 </v-list-item-content>
               </v-list-item>
 
-              <v-divider/>
-
-              <v-list-item key="users" to="/users" v-if="user.admin">
+              <v-list-item
+                key="subscription"
+                v-if="isPro && user.admin"
+                @click="subscriptionDialog = true"
+              >
                 <v-list-item-icon>
-                  <v-icon>mdi-account-multiple</v-icon>
+                  <v-icon
+                    color="#f14668"
+                    style="transform: scale(1.4)"
+                  >
+                    mdi-professional-hexagon
+                  </v-icon>
                 </v-list-item-icon>
 
                 <v-list-item-content>
-                  {{ $t('users') }}
+                  {{
+                    user.has_active_subscription
+                      ? 'Subscription details'
+                      : 'Activate subscription'
+                  }}
+                </v-list-item-content>
+              </v-list-item>
+
+              <v-divider/>
+
+              <v-list-item
+                key="runners"
+                to="/runners"
+                v-if="user.admin"
+              >
+                <v-list-item-icon>
+                  <v-icon>mdi-cogs</v-icon>
+                </v-list-item-icon>
+
+                <v-list-item-content>
+                  {{ $t('runners') }}
                 </v-list-item-content>
               </v-list-item>
 
@@ -482,16 +550,40 @@
               </v-list-item>
 
               <v-list-item
-                key="runners"
-                to="/runners"
-                v-if="user.admin && systemInfo.use_remote_runner"
+                key="tokens"
+                to="/tokens"
+                data-testid="sidebar-tokens"
               >
                 <v-list-item-icon>
-                  <v-icon>mdi-cogs</v-icon>
+                  <v-icon>mdi-api</v-icon>
                 </v-list-item-icon>
 
                 <v-list-item-content>
-                  {{ $t('runners') }}
+                  {{ $t('api_tokens') }}
+                </v-list-item-content>
+              </v-list-item>
+
+              <v-list-item key="users" to="/users" v-if="user.admin">
+                <v-list-item-icon>
+                  <v-icon>mdi-account-multiple</v-icon>
+                </v-list-item-icon>
+
+                <v-list-item-content>
+                  {{ $t('users') }}
+                </v-list-item-content>
+              </v-list-item>
+
+              <v-list-item
+                key="roles"
+                to="/roles"
+                v-if="isPro && user.admin"
+              >
+                <v-list-item-icon>
+                  <v-icon>mdi-account-cog</v-icon>
+                </v-list-item-icon>
+
+                <v-list-item-content>
+                  {{ $t('Roles') }}
                 </v-list-item-content>
               </v-list-item>
 
@@ -505,7 +597,9 @@
                 </v-list-item-content>
               </v-list-item>
 
-              <v-list-item key="sign_out" @click="signOut()">
+              <v-divider />
+
+              <v-list-item key="sign_out" @click="signOut()" data-testid="sidebar-signout">
                 <v-list-item-icon>
                   <v-icon>mdi-exit-to-app</v-icon>
                 </v-list-item-icon>
@@ -517,6 +611,24 @@
             </v-list>
           </v-menu>
 
+          <v-list-item
+            key="premium"
+            v-if="false && isPro && user.admin && !user.has_active_subscription"
+            @click="subscriptionDialog = true"
+            class="ActivatePremiumSubscriptionButton"
+          >
+            <v-list-item-icon>
+              <v-icon
+                color="white"
+              >mdi-professional-hexagon</v-icon>
+            </v-list-item-icon>
+            <v-list-item-content>
+              <v-list-item-title
+              >
+                Activate Subscription
+              </v-list-item-title>
+            </v-list-item-content>
+          </v-list-item>
         </v-list>
 
       </template>
@@ -530,10 +642,10 @@
         :userRole="(userRole || {}).role"
         :userId="(user || {}).id"
         :isAdmin="(user || {}).admin"
-        :webHost="(systemInfo || {}).web_host"
-        :version="(systemInfo || {version: ''}).version.split('-')[0]"
-        :premiumFeatures="((systemInfo || {premium_features: {}}).premium_features)"
         :user="user"
+        :premiumFeatures="((systemInfo || {premium_features: {}}).premium_features)"
+        :authMethods="(systemInfo || {auth_methods: {}}).auth_methods"
+        :systemInfo="systemInfo"
       ></router-view>
     </v-main>
 
@@ -587,6 +699,57 @@
   <v-app v-else></v-app>
 </template>
 <style lang="scss">
+.NewProSubscriptionMenuItem {
+  transition: 0.2s transform;
+  .v-list-item__content, .v-list-item__icon {
+    transition: 0.5s transform;
+  }
+  &:hover {
+
+    transform: scale(1.05) translateY(-1px);
+
+    // .v-list-item__content {
+    //   transform: scale(1.05) translateX(2px);
+    // }
+    .v-list-item__icon {
+      // transform: rotate(-360deg);
+    }
+  }
+}
+.ActivatePremiumSubscriptionButton {
+  background: hsl(348deg, 86%, 61%);
+  //transform: scale(0.9);
+  //border-radius: 6px;
+  //transition: 0.2s transform;
+  //margin-bottom: 10px;
+}
+
+.theme--dark {
+  --highlighted-card-bg-color: #262626;
+}
+
+.theme--light {
+  --highlighted-card-bg-color: #F3F3F3;
+}
+
+.DarkModeSwitch {
+  .v-input__prepend-outer {
+    transform: translateY(1px);
+
+    .v-icon {
+      color: #cacaca !important;
+    }
+  }
+
+  .v-input__append-outer {
+    margin-left: 5px;
+    transform: translateY(-1px);
+
+    .v-icon {
+      color: #2196f3 !important;
+    }
+  }
+}
 
 .v-dialog > .v-card > .v-card__title {
   flex-wrap: nowrap;
@@ -599,7 +762,6 @@
 
 .v-data-table tbody tr.v-data-table__expanded__content {
   box-shadow: none !important;
-
 }
 
 .v-data-table a {
@@ -662,6 +824,7 @@
   td:first-child, th:first-child {
     padding-left: 2px !important;
   }
+
   td:last-child, th:last-child {
     padding-right: 2px !important;
   }
@@ -673,6 +836,7 @@
 
   .v-data-table__wrapper > table > tbody > tr {
     background: transparent !important;
+
     &:hover {
       background-color: rgba(143, 143, 143, 0.04) !important;
     }
@@ -706,6 +870,10 @@
   margin-left: 10px !important;
 }
 
+.v-slide-group__prev--disabled {
+  display: none !important;
+}
+
 @media (min-width: 960px) {
   .v-app-bar__nav-icon {
     display: none !important;
@@ -715,6 +883,51 @@
     padding-left: 0 !important;
     margin-left: 0 !important;
   }
+}
+
+.v-input {
+  .v-input__slot fieldset {
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: rgba(133, 133, 133, 0.4);
+    background-color: rgba(133, 133, 133, 0.1);
+  }
+
+  .v-label--active {
+    text-shadow: 0 0 2px black;
+    font-weight: 500;
+  }
+
+  &.primary--text {
+    .v-input__slot fieldset {
+      border-width: 2px;
+      border-color: #2196f3;
+    }
+  }
+
+  &.error--text {
+    .v-input__slot fieldset {
+      border-width: 2px;
+      border-color: #ff5252;
+    }
+  }
+}
+
+.v-input--is-disabled {
+  opacity: 0.5;
+}
+
+.theme--light {
+  .v-input {
+    .v-label--active {
+      text-shadow: 0 0 2px white;
+    }
+  }
+}
+
+.v-list--dense .v-list-item .v-list-item__title {
+  font-weight: normal;
+  font-size: 1rem;
 }
 
 @import '~vuetify/src/styles/styles.sass';
@@ -729,14 +942,16 @@
 import axios from 'axios';
 import { getErrorMessage } from '@/lib/error';
 import EditDialog from '@/components/EditDialog.vue';
-import TaskLogView from '@/components/TaskLogView.vue';
 import ProjectForm from '@/components/ProjectForm.vue';
 import UserForm from '@/components/UserForm.vue';
-import ChangePasswordForm from '@/components/ChangePasswordForm.vue';
 import EventBus from '@/event-bus';
 import socket from '@/socket';
+
+import SubscriptionForm from '@/components/SubscriptionForm.vue';
 import RestoreProjectForm from '@/components/RestoreProjectForm.vue';
 import YesNoDialog from '@/components/YesNoDialog.vue';
+import TaskLogDialog from '@/components/TaskLogDialog.vue';
+import delay from '@/lib/delay';
 
 const PROJECT_COLORS = [
   'red',
@@ -747,62 +962,59 @@ const PROJECT_COLORS = [
 
 const LANGUAGES = {
   en: {
-    flag: '🇺🇸',
     title: 'English',
   },
   es: {
-    flag: '🇨🇱',
     title: 'Español',
   },
   ru: {
-    flag: '🇷🇺',
     title: 'Russian',
   },
   de: {
-    flag: '🇩🇪',
     title: 'German',
   },
+  nl: {
+    title: 'Dutch (Netherlands)',
+  },
   zh_cn: {
-    flag: '🇨🇳',
     title: '中文(大陆)',
   },
   zh_tw: {
-    flag: '🇹🇼',
     title: '中文(台灣)',
   },
   fr: {
-    flag: '🇫🇷',
     title: 'French',
   },
   it: {
-    flag: '🇮🇹',
     title: 'Italian',
   },
   pl: {
-    flag: '🇵🇱️',
     title: 'Polish',
   },
   pt: {
-    flag: '🇵🇹',
     title: 'Portuguese',
   },
   pt_br: {
-    flag: '🇧🇷',
     title: 'Português do Brasil',
   },
 };
 
 function getLangInfo(locale) {
-  let res = LANGUAGES[locale];
+  let lang = locale;
+  let res = LANGUAGES[lang];
 
   // failback short i18n
   if (!res) {
-    res = LANGUAGES[locale.split('_')[0]];
+    lang = lang.split('_')[0];
+    res = LANGUAGES[lang];
   }
 
   if (!res) {
-    res = LANGUAGES.en;
+    lang = 'en';
+    res = LANGUAGES[lang];
   }
+
+  res.flag = lang;
 
   return res;
 }
@@ -816,12 +1028,12 @@ function getSystemLang() {
 export default {
   name: 'App',
   components: {
+    SubscriptionForm,
+    TaskLogDialog,
     YesNoDialog,
     RestoreProjectForm,
-    ChangePasswordForm,
     UserForm,
     EditDialog,
-    TaskLogView,
     ProjectForm,
   },
   data() {
@@ -839,13 +1051,15 @@ export default {
       newProjectType: '',
       userDialog: null,
       hideUserDialogButtons: false,
-      passwordDialog: null,
+
+      subscriptionDialog: null,
+
       restoreProjectDialog: null,
       restoreProjectResult: null,
       restoreProjectResultDialog: null,
 
       taskLogDialog: null,
-      task: null,
+      taskId: null,
       template: null,
       darkMode: false,
       languages: [
@@ -856,6 +1070,7 @@ export default {
         },
         ...Object.keys(LANGUAGES).map((lang) => ({
           id: lang,
+          flag: lang,
           ...LANGUAGES[lang],
         })),
       ],
@@ -866,8 +1081,14 @@ export default {
     async projects(val) {
       if (val.length === 0
         && this.$route.path.startsWith('/project/')
-        && this.$route.path !== '/project/new') {
-        await this.$router.push({ path: '/project/new' });
+        && this.$route.path !== '/project/new'
+        && this.$route.path !== '/project/premium'
+      ) {
+        if (this.$route.query.new_project === 'premium') {
+          await this.$router.push({ path: '/project/premium' });
+        } else {
+          await this.$router.push({ path: '/project/new' });
+        }
       }
     },
 
@@ -879,6 +1100,10 @@ export default {
         if (taskId) {
           EventBus.$emit('i-show-task', { taskId });
         }
+      }
+
+      if ((this.projects || []).length > 0 && this.$route.query.new_project) {
+        EventBus.$emit('i-new-project', { projectType: this.$route.query.new_project });
       }
     },
 
@@ -893,6 +1118,10 @@ export default {
   },
 
   computed: {
+
+    isPro() {
+      return (process.env.VUE_APP_BUILD_TYPE || '').startsWith('pro_');
+    },
 
     lang() {
       const locale = localStorage.getItem('lang');
@@ -938,7 +1167,10 @@ export default {
     } catch (err) {
       if (err.response && err.response.status === 401) {
         if (this.$route.path !== '/auth/login') {
-          await this.$router.push({ path: '/auth/login' });
+          await this.$router.push({
+            path: '/auth/login',
+            query: { redirect: this.$route.fullPath },
+          });
         }
         this.state = 'success';
         return;
@@ -968,24 +1200,21 @@ export default {
       this.drawer = true;
     });
 
+    EventBus.$on('i-new-project', (e) => {
+      setTimeout(() => {
+        this.showNewProjectDialogue(e.projectType);
+      }, 500);
+    });
+
     EventBus.$on('i-show-task', async (e) => {
       if (parseInt(this.$route.query.t || '', 10) !== e.taskId) {
         const query = { ...this.$route.query, t: e.taskId };
         await this.$router.replace({ query });
+        return;
       }
 
-      this.task = (await axios({
-        method: 'get',
-        url: `/api/project/${this.projectId}/tasks/${e.taskId}`,
-        responseType: 'json',
-      })).data;
-
-      this.template = (await axios({
-        method: 'get',
-        url: `/api/project/${this.projectId}/templates/${this.task.template_id}`,
-        responseType: 'json',
-      })).data;
-
+      this.taskId = e.taskId;
+      await delay(1);
       this.taskLogDialog = true;
     });
 
@@ -1066,7 +1295,7 @@ export default {
       switch (e.action) {
         case 'new':
         case 'restore':
-          await this.selectProject(e.item.id);
+          await this.selectProject(e.item.id, { new_project: undefined });
           break;
         case 'delete':
           if (this.projectId === e.item.id && this.projects.length > 0) {
@@ -1090,9 +1319,19 @@ export default {
       await this.loadUserInfo();
     },
 
+    showNewProjectDialogue(projectType = '') {
+      this.newProjectDialog = true;
+      this.newProjectType = projectType;
+    },
+
     selectLanguage(lang) {
       localStorage.setItem('lang', lang);
       window.location.reload();
+    },
+
+    async onNewProjectDialogueClosed() {
+      const query = { ...this.$route.query, new_project: undefined };
+      await this.$router.replace({ query });
     },
 
     async onTaskLogDialogClosed() {
@@ -1121,6 +1360,10 @@ export default {
         if (taskId) {
           EventBus.$emit('i-show-task', { taskId });
         }
+      }
+
+      if ((this.projects || []).length > 0 && this.$route.query.new_project != null) {
+        EventBus.$emit('i-new-project', { projectType: this.$route.query.new_project });
       }
     },
 
@@ -1152,7 +1395,7 @@ export default {
       }
     },
 
-    async selectProject(projectId) {
+    async selectProject(projectId, overriderQuery = {}) {
       this.userRole = (await axios({
         method: 'get',
         url: `/api/project/${projectId}/role`,
@@ -1164,7 +1407,25 @@ export default {
         return;
       }
 
-      await this.$router.push({ path: `/project/${projectId}` });
+      let query = {};
+
+      switch (this.$route.path) {
+        case '/project/new':
+          query.new_project = '';
+          break;
+        default:
+          break;
+      }
+
+      query = {
+        ...query,
+        ...overriderQuery,
+      };
+
+      await this.$router.push({
+        path: `/project/${projectId}${window.location.search}`,
+        query,
+      });
     },
 
     async loadProjects() {
@@ -1238,17 +1499,24 @@ export default {
       this.snackbarColor = '';
       this.snackbarText = '';
 
-      socket.stop();
+      try {
+        (await axios({
+          method: 'post',
+          url: '/api/auth/logout',
+          responseType: 'json',
+        }));
 
-      (await axios({
-        method: 'post',
-        url: '/api/auth/logout',
-        responseType: 'json',
-      }));
+        socket.stop();
 
-      if (this.$route.path !== '/auth/login') {
-        await this.$router.push({ path: '/auth/login' });
-        this.state = 'success';
+        if (this.$route.path !== '/auth/login') {
+          await this.$router.push({ path: '/auth/login' });
+          this.state = 'success';
+        }
+      } catch (err) {
+        EventBus.$emit('i-snackbar', {
+          color: 'error',
+          text: getErrorMessage(err),
+        });
       }
     },
 
