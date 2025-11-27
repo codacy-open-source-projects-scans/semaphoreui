@@ -183,8 +183,9 @@ const routes = [
     component: Tokens,
   },
   {
-    path: '/accept-invite',
+    path: '/accept-invite/:token',
     component: AcceptInvite,
+    props: true,
   },
 ];
 
