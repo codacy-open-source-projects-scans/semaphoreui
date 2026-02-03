@@ -55,14 +55,19 @@
         label="Enter your PRO key"
         :rules="[(v) => !!v || $t('key_required')]"
         required
-        :disabled="formSaving"
+        :disabled="formSaving || item.managed_by_config"
         outlined
         dense
       ></v-textarea>
 
       <v-row>
         <v-col>
-          <v-btn @click="save" style="width: 100%" color="success" :disabled="formSaving">
+          <v-btn
+            @click="save"
+            style="width: 100%"
+            color="success"
+            :disabled="formSaving || item.managed_by_config"
+          >
             <v-progress-circular
               v-if="formSaving"
               indeterminate
@@ -232,6 +237,12 @@ export default {
   },
 
   methods: {
+    afterLoadData() {
+      if (this.item.error) {
+        this.formError = this.item.error;
+      }
+    },
+
     async makeProUser() {
       try {
         const user = (await axios.get('/api/user')).data;
