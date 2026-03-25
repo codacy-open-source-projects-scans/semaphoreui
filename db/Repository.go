@@ -66,6 +66,10 @@ func (r Repository) GetFullPath(templateID int) string {
 func (r Repository) GetGitURL(secure bool) string {
 	url := r.GitURL
 
+	if r.GetType() == RepositoryLocal {
+		return util.NormalizeLocalFilesystemPath(url)
+	}
+
 	if secure {
 		return url
 	}
@@ -105,6 +109,10 @@ func (r Repository) GetType() RepositoryType {
 		return RepositoryLocal
 	}
 
+	if util.IsWindowsLocalRepositoryPath(r.GitURL) {
+		return RepositoryLocal
+	}
+
 	re := regexp.MustCompile(`^(\w+)://`)
 	m := re.FindStringSubmatch(r.GitURL)
 	if m == nil {
@@ -132,6 +140,10 @@ func (r Repository) Validate() error {
 
 	if r.GetType() != RepositoryLocal && r.GitBranch == "" {
 		return &ValidationError{"repository branch can't be empty"}
+	}
+
+	if err := ValidateGitBranch(r.GitBranch, "repository"); err != nil {
+		return err
 	}
 
 	return nil
