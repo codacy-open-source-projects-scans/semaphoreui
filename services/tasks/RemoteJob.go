@@ -2,21 +2,22 @@ package tasks
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"time"
 
-	"github.com/semaphoreui/semaphore/pkg/tz"
-	log "github.com/sirupsen/logrus"
-
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
+	"github.com/semaphoreui/semaphore/pkg/tz"
 	"github.com/semaphoreui/semaphore/util"
+	log "github.com/sirupsen/logrus"
 )
 
-// ErrAllRunnersBusy is returned when all available runners are busy
+// ErrAllRunnersBusy is returned when all available runners are busy. Used for logic
 var ErrAllRunnersBusy = errors.New("all runners busy")
 
 type RemoteJob struct {
@@ -38,12 +39,6 @@ func callRunnerWebhook(runner *db.Runner, tsk *TaskRunner, action string) (err e
 	if runner.Webhook == "" {
 		return
 	}
-
-	log.WithFields(log.Fields{
-		"runner_id": runner.ID,
-		"task_id":   tsk.Task.ID,
-		"action":    action,
-	}).Infof("Calling runner webhook")
 
 	var jsonBytes []byte
 	jsonBytes, err = json.Marshal(runnerWebhookPayload{
@@ -82,17 +77,35 @@ func callRunnerWebhook(runner *db.Runner, tsk *TaskRunner, action string) (err e
 		return
 	}
 
-	log.WithFields(log.Fields{
-		"runner_id": runner.ID,
-		"task_id":   tsk.Task.ID,
-		"action":    action,
-	}).Infof("Runner webhook returned %d", resp.StatusCode)
-
 	return
 }
 
-func (t *RemoteJob) Run(username string, incomingVersion *string, alias string) (err error) {
+func shuffleRunners(rs []db.Runner) []db.Runner {
+	if len(rs) < 2 {
+		return rs
+	}
 
+	// Work on a copy so that if randomness fails, we can safely return the original order.
+	shuffled := make([]db.Runner, len(rs))
+	copy(shuffled, rs)
+
+	// Fisher–Yates shuffle using crypto/rand: for each i, pick j in [0, i].
+	for i := len(shuffled) - 1; i > 0; i-- {
+		max := big.NewInt(int64(i + 1))
+		j, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			log.WithError(err).Warn("failed to shuffle runners, using original order")
+			return rs
+		}
+
+		ji := int(j.Int64())
+		shuffled[i], shuffled[ji] = shuffled[ji], shuffled[i]
+	}
+
+	return shuffled
+}
+
+func (t *RemoteJob) Run(username string, incomingVersion *string, alias string) (err error) {
 	tsk, err := t.taskPool.GetTask(t.Task.ID)
 
 	if err != nil {
@@ -110,16 +123,21 @@ func (t *RemoteJob) Run(username string, incomingVersion *string, alias string) 
 
 	var runners []db.Runner
 	db.StoreSession(t.taskPool.store, "run remote job", func() {
+
 		var projectRunners []db.Runner
 		projectRunners, err = t.taskPool.store.GetRunners(t.Task.ProjectID, true, t.RunnerTag)
 		if err != nil {
 			return
 		}
+		projectRunners = shuffleRunners(projectRunners)
+
 		var globalRunners []db.Runner
 		globalRunners, err = t.taskPool.store.GetAllRunners(true, true)
 		if err != nil {
 			return
 		}
+		globalRunners = shuffleRunners(globalRunners)
+
 		runners = append(runners, projectRunners...)
 		runners = append(runners, globalRunners...)
 	})
@@ -154,8 +172,8 @@ func (t *RemoteJob) Run(username string, incomingVersion *string, alias string) 
 		return
 	}
 
-	tsk.RunnerID = runner.ID
 	tsk.Task.RunnerID = &runner.ID
+
 	db.StoreSession(t.taskPool.store, "remote job assign runner", func() {
 		err = t.taskPool.store.UpdateTask(tsk.Task)
 	})
