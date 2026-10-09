@@ -42,8 +42,13 @@
 
     <v-tabs class="task-log-view__tabs" right v-model="tab">
       <v-tab>Log</v-tab>
-      <v-tab :disabled="!isTaskStopped">Details</v-tab>
-      <v-tab v-if="isPro" :disabled="!isTaskStopped">Summary</v-tab>
+      <v-tab>Details</v-tab>
+      <v-tab
+        v-if="isPro"
+        :disabled="!isTaskStopped"
+      >
+        Summary
+      </v-tab>
     </v-tabs>
 
     <div v-if="tab === 0">
@@ -111,7 +116,13 @@
       <v-divider style="margin-top: -1px;" />
 
       <v-container fluid class="py-0 px-5 overflow-auto pt-4">
-        <TaskDetails :item="item" :user="user" :project-id="projectId" />
+        <TaskDetails
+          :item="item"
+          :user="user"
+          :schedule="schedule"
+          :integration="integration"
+          :project-id="projectId"
+        />
       </v-container>
     </div>
 
@@ -119,7 +130,7 @@
       <v-divider style="margin-top: -1px;" />
 
       <AnsibleStageView
-        :premium-features="systemInfo.premium_features"
+        :features="systemInfo.features"
         :project-id="projectId"
         :task-id="itemId"
       />
@@ -216,6 +227,8 @@ $task-log-status-tab-height:
 .task-log-records__time {
   width: 120px;
   min-width: 120px;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .task-log-records__output {
@@ -245,7 +258,7 @@ export default {
     item: Object,
     projectId: Number,
     systemInfo: Object,
-    premiumFeatures: null,
+    features: null,
   },
 
   data() {
@@ -255,6 +268,11 @@ export default {
       output: [],
       outputBuffer: [],
       user: {},
+      // The schedule or integration that started this task, resolved by id so
+      // the details panel can name and link it. Null when the task was started
+      // by a person, or when the origin has since been deleted.
+      schedule: null,
+      integration: null,
       autoScroll: true,
       // stages: null,
     };
@@ -347,12 +365,13 @@ export default {
         });
       });
     }, 1000);
-    socket.addListener((data) => this.onWebsocketDataReceived(data));
+    this.socketListenerId = socket.addListener((data) => this.onWebsocketDataReceived(data));
     await this.loadData();
   },
 
   beforeDestroy() {
     clearInterval(this.outputInterval);
+    socket.removeListener(this.socketListenerId);
   },
 
   methods: {
@@ -390,6 +409,8 @@ export default {
       this.outputBuffer = [];
       this.outputInterval = null;
       this.user = {};
+      this.schedule = null;
+      this.integration = null;
     },
 
     onWebsocketDataReceived(data) {
@@ -415,11 +436,31 @@ export default {
       }
     },
 
+    // Only a 404 proves the origin is gone. A timeout or a 500 means we simply
+    // do not know, and must not be reported to the user as "deleted".
+    async loadOrigin(url) {
+      try {
+        return { status: 'ready', data: (await axios({ method: 'get', url, responseType: 'json' })).data };
+      } catch (e) {
+        return { status: e.response && e.response.status === 404 ? 'missing' : 'error', data: null };
+      }
+    },
+
     async loadData() {
-      [
-        this.output,
-        this.user,
-      ] = await Promise.all([
+      // Distinguishes "still loading" from "not there", so a valid origin is
+      // never briefly labelled as deleted.
+      if (this.item.schedule_id) {
+        this.schedule = { status: 'loading', data: null };
+      }
+      if (this.item.integration_id) {
+        this.integration = { status: 'loading', data: null };
+      }
+
+      // These requests are fired again on every task change; without this the
+      // slower response of an earlier task can land after a later one.
+      const requested = { project: this.projectId, task: this.itemId };
+
+      const [output, user, schedule, integration] = await Promise.all([
 
         (await axios({
           method: 'get',
@@ -435,7 +476,24 @@ export default {
           url: `/api/users/${this.item.user_id}`,
           responseType: 'json',
         })).data : null,
+
+        this.item.schedule_id
+          ? this.loadOrigin(`/api/project/${this.projectId}/schedules/${this.item.schedule_id}`)
+          : null,
+
+        this.item.integration_id
+          ? this.loadOrigin(`/api/project/${this.projectId}/integrations/${this.item.integration_id}`)
+          : null,
       ]);
+
+      if (requested.project !== this.projectId || requested.task !== this.itemId) {
+        return;
+      }
+
+      this.output = output;
+      this.user = user;
+      this.schedule = schedule;
+      this.integration = integration;
     },
   },
 };

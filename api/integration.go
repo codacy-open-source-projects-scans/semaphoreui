@@ -3,14 +3,17 @@ package api
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/semaphoreui/semaphore/pkg/conv"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/services/server"
 	task2 "github.com/semaphoreui/semaphore/services/tasks"
 
@@ -20,10 +23,10 @@ import (
 	"github.com/thedevsaddam/gojsonq/v2"
 )
 
-// isValidHmacPayload checks if the GitHub payload's hash fits with
-// the hash computed by GitHub sent as a header
-func isValidHmacPayload(secret, headerHash string, payload []byte, prefix string) bool {
-	hash := hmacHashPayload(secret, payload)
+// isValidHmacPayload checks if the payload's hash fits with
+// the hash computed by the sender and sent as a header
+func isValidHmacPayload(secret, headerHash string, payload []byte, prefix string, hashFunc func() hash.Hash) bool {
+	hash := hmacHashPayload(secret, payload, hashFunc)
 
 	if !strings.HasPrefix(headerHash, prefix) {
 		return false
@@ -40,39 +43,36 @@ func isValidHmacPayload(secret, headerHash string, payload []byte, prefix string
 // hmacHashPayload computes the hash of payload's body according to the webhook's secret token
 // see https://developer.github.com/webhooks/securing/#validating-payloads-from-github
 // returning the hash as a hexadecimal string
-func hmacHashPayload(secret string, payloadBody []byte) string {
-	hm := hmac.New(sha256.New, []byte(secret))
+func hmacHashPayload(secret string, payloadBody []byte, hashFunc func() hash.Hash) string {
+	hm := hmac.New(hashFunc, []byte(secret))
 	hm.Write(payloadBody)
 	sum := hm.Sum(nil)
 	return fmt.Sprintf("%x", sum)
 }
 
 type IntegrationController struct {
+	store              db.Store
 	integrationService server.IntegrationService
 }
 
-func NewIntegrationController(integrationService server.IntegrationService) *IntegrationController {
+func NewIntegrationController(store db.Store, integrationService server.IntegrationService) *IntegrationController {
 	return &IntegrationController{
+		store:              store,
 		integrationService: integrationService,
 	}
 }
 
 func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *http.Request) {
 
-	var err error
+	integrationAlias, ok := helpers.GetStrParamOrAbort("integration_alias", w, r)
 
-	integrationAlias, err := helpers.GetStrParam("integration_alias", w, r)
-
-	if err != nil {
-		log.Error(err)
+	if !ok {
 		return
 	}
 
 	log.Info(fmt.Sprintf("Receiving Integration from: %s", r.RemoteAddr))
 
-	store := helpers.Store(r)
-
-	integrations, level, err := store.GetIntegrationsByAlias(integrationAlias)
+	integrations, level, err := c.store.GetIntegrationsByAlias(integrationAlias)
 
 	if err != nil {
 		log.Error(err)
@@ -96,7 +96,7 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 
 		project, ok := projects[integration.ProjectID]
 		if !ok {
-			project, err = store.GetProject(integrations[0].ProjectID)
+			project, err = c.store.GetProject(integrations[0].ProjectID)
 			if err != nil {
 				log.Error(err)
 				return
@@ -125,7 +125,8 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 				integration.AuthSecret.LoginPassword.Password,
 				r.Header.Get("X-Hub-Signature-256"),
 				payload,
-				"sha256=")
+				"sha256=",
+				sha256.New)
 
 			if !ok {
 				log.WithFields(log.Fields{
@@ -138,7 +139,8 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 				integration.AuthSecret.LoginPassword.Password,
 				r.Header.Get("x-hub-signature"),
 				payload,
-				"sha256=")
+				"sha256=",
+				sha256.New)
 
 			if !ok {
 				log.WithFields(log.Fields{
@@ -151,12 +153,27 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 				integration.AuthSecret.LoginPassword.Password,
 				r.Header.Get(integration.AuthHeader),
 				payload,
-				"")
+				"",
+				sha256.New)
 
 			if !ok {
 				log.WithFields(log.Fields{
 					"context": "integrations",
 				}).Error("Invalid HMAC signature")
+				continue
+			}
+		case db.IntegrationAuthHmacSha512:
+			ok := isValidHmacPayload(
+				integration.AuthSecret.LoginPassword.Password,
+				r.Header.Get(integration.AuthHeader),
+				payload,
+				"",
+				sha512.New)
+
+			if !ok {
+				log.WithFields(log.Fields{
+					"context": "integrations",
+				}).Error("Invalid HMAC-SHA512 signature")
 				continue
 			}
 		case db.IntegrationAuthToken:
@@ -185,7 +202,7 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 
 		if level != db.IntegrationAliasSingle {
 			var matchers []db.IntegrationMatcher
-			matchers, err = store.GetIntegrationMatchers(integration.ProjectID, db.RetrieveQueryParams{}, integration.ID)
+			matchers, err = c.store.GetIntegrationMatchers(integration.ProjectID, db.RetrieveQueryParams{}, integration.ID)
 			if err != nil {
 				log.WithFields(log.Fields{
 					"context": "integrations",
@@ -210,7 +227,7 @@ func (c *IntegrationController) ReceiveIntegration(w http.ResponseWriter, r *htt
 			}
 		}
 
-		task := RunIntegration(integration, project, r, payload)
+		task := c.RunIntegration(integration, project, r, payload)
 		if task != nil {
 			w.Header().Add("X-Semaphore-Task-ID", strconv.Itoa(task.ID))
 			w.Header().Add("X-Semaphore-Template-ID", strconv.Itoa(task.TemplateID))
@@ -330,6 +347,10 @@ func GetTaskDefinition(
 
 	taskDefinition.Environment = string(envStr)
 
+	if taskDefinition.Params == nil {
+		taskDefinition.Params = make(db.MapStringAnyField)
+	}
+
 	extractedTaskResults := Extract(taskValues, h, payload)
 	for k, v := range extractedTaskResults {
 		taskDefinition.Params[k] = v
@@ -338,14 +359,14 @@ func GetTaskDefinition(
 	return
 }
 
-func RunIntegration(integration db.Integration, project db.Project, r *http.Request, payload []byte) (taskRef *db.Task) {
+func (c *IntegrationController) RunIntegration(integration db.Integration, project db.Project, r *http.Request, payload []byte) (taskRef *db.Task) {
 	taskRef = nil
 
 	log.Info(fmt.Sprintf("Running integration %d", integration.ID))
 
 	taskDefinition, err := GetTaskDefinition(
 		integration, payload, r.Header, func(projectID, integrationID int) ([]db.IntegrationExtractValue, error) {
-			return helpers.Store(r).GetIntegrationExtractValues(projectID, db.RetrieveQueryParams{}, integrationID)
+			return c.store.GetIntegrationExtractValues(projectID, db.RetrieveQueryParams{}, integrationID)
 		})
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
@@ -355,7 +376,7 @@ func RunIntegration(integration db.Integration, project db.Project, r *http.Requ
 		return
 	}
 
-	tpl, err := helpers.Store(r).GetTemplate(integration.ProjectID, integration.TemplateID)
+	tpl, err := c.store.GetTemplate(integration.ProjectID, integration.TemplateID)
 	if err != nil {
 		log.Error(err)
 		return
@@ -363,7 +384,9 @@ func RunIntegration(integration db.Integration, project db.Project, r *http.Requ
 
 	pool := helpers.GetFromContext(r, "task_pool").(*task2.TaskPool)
 
-	task, err := pool.AddTask(taskDefinition, nil, "", integration.ProjectID, tpl.App.NeedTaskAlias())
+	// The webhook caller authenticates as the integration, and its address stays in the request context.
+	ctx := audit.WithActor(r.Context(), audit.IntegrationActor(integration.ID, integration.Name))
+	task, err := pool.AddTaskFrom(ctx, audit.TriggerIntegration, taskDefinition, nil, "", integration.ProjectID, tpl.App.NeedTaskAlias())
 	if err != nil {
 		log.Error(err)
 		return
@@ -374,8 +397,8 @@ func RunIntegration(integration db.Integration, project db.Project, r *http.Requ
 	return
 }
 
-func Extract(extractValues []db.IntegrationExtractValue, h http.Header, payload []byte) (result map[string]string) {
-	result = make(map[string]string)
+func Extract(extractValues []db.IntegrationExtractValue, h http.Header, payload []byte) (result map[string]any) {
+	result = make(map[string]any)
 
 	for _, extractValue := range extractValues {
 		switch extractValue.ValueSource {
@@ -386,7 +409,7 @@ func Extract(extractValues []db.IntegrationExtractValue, h http.Header, payload 
 			case db.IntegrationBodyDataJSON:
 				val := gojsonq.New().JSONString(string(payload)).Find(extractValue.Key)
 				if val != nil {
-					result[extractValue.Variable] = fmt.Sprintf("%v", val)
+					result[extractValue.Variable] = val
 				}
 			case db.IntegrationBodyDataString:
 				result[extractValue.Variable] = string(payload)

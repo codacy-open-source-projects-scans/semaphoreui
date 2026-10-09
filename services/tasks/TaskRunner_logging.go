@@ -2,16 +2,19 @@ package tasks
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/semaphoreui/semaphore/pkg/tz"
 
 	"github.com/semaphoreui/semaphore/api/sockets"
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -57,16 +60,32 @@ func (t *TaskRunner) LogfWithTime(now time.Time, format string, a ...any) {
 	t.LogWithTime(now, fmt.Sprintf(format, a...))
 }
 
-func (t *TaskRunner) LogCmd(cmd *exec.Cmd) {
-	stderr, _ := cmd.StderrPipe()
-	stdout, _ := cmd.StdoutPipe()
+func (t *TaskRunner) LogCmd(cmd *exec.Cmd) func() {
+	// io.PipeWriter is not *os.File, so os/exec owns and waits for output copying.
+	stderr, stderrWriter := io.Pipe()
+	stdout, stdoutWriter := io.Pipe()
+	cmd.Stderr = stderrWriter
+	cmd.Stdout = stdoutWriter
 
-	go t.logPipe(stderr)
-	go t.logPipe(stdout)
-}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		t.logPipe(stderr)
+	}()
+	go func() {
+		defer wg.Done()
+		t.logPipe(stdout)
+	}()
 
-func (t *TaskRunner) WaitLog() {
-	t.logWG.Wait()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = stderrWriter.Close()
+			_ = stdoutWriter.Close()
+			wg.Wait()
+		})
+	}
 }
 
 func (t *TaskRunner) SetCommit(hash, message string) {
@@ -83,6 +102,8 @@ func (t *TaskRunner) SetStatus(status task_logger.TaskStatus) {
 	if status == t.Task.Status {
 		return
 	}
+
+	oldStatus := t.Task.Status
 
 	switch t.Task.Status { // check old status
 	case task_logger.TaskConfirmed:
@@ -105,6 +126,9 @@ func (t *TaskRunner) SetStatus(status task_logger.TaskStatus) {
 	}
 
 	t.Task.Status = status
+	if t.pool != nil {
+		t.pool.metrics.RecordTaskStatusChange(oldStatus, status)
+	}
 
 	if status == task_logger.TaskRunningStatus {
 		now := tz.Now()
@@ -113,7 +137,20 @@ func (t *TaskRunner) SetStatus(status task_logger.TaskStatus) {
 
 	t.saveStatus()
 
-	if localJob, ok := t.job.(*LocalJob); ok {
+	if status == task_logger.TaskWaitingConfirmation && t.pool != nil {
+		actor := audit.SystemActor(audit.ComponentTaskRunner)
+		if t.Task.RunnerID != nil {
+			actor = audit.RunnerActor(*t.Task.RunnerID, "")
+		}
+		t.pool.recorder().Record(audit.WithActor(context.Background(), actor), audit.Event{
+			Kind:      audit.TaskApprovalRequest,
+			Target:    audit.ResourceTarget(audit.TargetTask, t.Task.ID, t.Template.Name),
+			ProjectID: t.Task.ProjectID,
+			Metadata:  audit.TaskMetadata{TemplateID: t.Task.TemplateID},
+		})
+	}
+
+	if localJob, ok := t.job.(*LocalExecutor); ok {
 		localJob.SetStatus(status)
 	}
 
@@ -151,17 +188,21 @@ func (t *TaskRunner) panicOnError(err error, msg string) {
 }
 
 func (t *TaskRunner) logPipe(reader io.Reader) {
-	t.logWG.Add(1)
-
 	linesCh := make(chan string, 100000)
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close() //nolint:errcheck
+	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer t.logWG.Done()
+		defer wg.Done()
 
 		for line := range linesCh {
 			t.Log(line)
 		}
 	}()
+	defer wg.Wait()
 
 	scanner := bufio.NewScanner(reader)
 	const maxCapacity = 10 * 1024 * 1024 // 10 MB

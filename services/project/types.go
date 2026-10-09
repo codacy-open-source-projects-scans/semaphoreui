@@ -8,6 +8,7 @@ type BackupDB struct {
 	meta         db.Project
 	templates    []db.Template
 	repositories []db.Repository
+	hostConfigs  []db.HostConfig
 	keys         []db.AccessKey
 	views        []db.View
 	inventories  []db.Inventory
@@ -25,12 +26,22 @@ type BackupDB struct {
 	roles          []db.Role
 	templateRoles  map[int][]db.TemplateRolePerm
 	runners        []db.Runner
+	workflows      []db.WorkflowTemplate
+
+	// store is the main store every entity restores into. Held here so Restore
+	// implementations read it from BackupDB instead of taking it as a parameter.
+	store db.Store
+	// workflowStore persists workflow templates. Workflows are a Pro feature
+	// living outside db.Store (see db.WorkflowManager), so it is injected
+	// separately rather than reached through store.
+	workflowStore db.WorkflowManager
 }
 
 type BackupFormat struct {
 	Meta               BackupMeta            `backup:"meta"`
 	Templates          []BackupTemplate      `backup:"templates"`
 	Repositories       []BackupRepository    `backup:"repositories"`
+	HostConfigs        []BackupHostConfig    `backup:"host_configs"`
 	Keys               []BackupAccessKey     `backup:"keys"`
 	Views              []BackupView          `backup:"views"`
 	Inventories        []BackupInventory     `backup:"inventories"`
@@ -41,6 +52,7 @@ type BackupFormat struct {
 	SecretStorages     []BackupSecretStorage `backup:"secret_storages"`
 	Roles              []BackupRole          `backup:"roles"`
 	Runners            []BackupRunner        `backup:"runners"`
+	Workflows          []BackupWorkflow      `backup:"workflows"`
 }
 
 type BackupMeta struct {
@@ -78,6 +90,11 @@ type BackupRepository struct {
 	SSHKey *string `backup:"ssh_key"`
 }
 
+type BackupHostConfig struct {
+	db.HostConfig
+	SSHKey *string `backup:"ssh_key"`
+}
+
 type BackupTemplateRole struct {
 	Role        string                   `backup:"role"`
 	IsGlobal    bool                     `backup:"is_global"`
@@ -89,7 +106,7 @@ type BackupTemplate struct {
 
 	Inventory     *string               `backup:"inventory"`
 	Repository    string                `backup:"repository"`
-	Environment   *string               `backup:"environment"`
+	Environments  []string              `backup:"environments"`
 	BuildTemplate *string               `backup:"build_template"`
 	View          *string               `backup:"view"`
 	Vaults        []BackupTemplateVault `backup:"vaults"`
@@ -127,10 +144,27 @@ type BackupRunner struct {
 	db.Runner
 }
 
+// BackupWorkflow wraps a workflow template for export/import. Nodes are wrapped
+// separately so their template reference can be stored by name instead of by
+// project-scoped ID. Edges (carried by the embedded WorkflowTemplate) reference
+// nodes by ID, which is preserved verbatim and remapped on restore.
+type BackupWorkflow struct {
+	db.WorkflowTemplate
+	Nodes []BackupWorkflowNode `backup:"nodes"`
+}
+
+// BackupWorkflowNode wraps a workflow node, replacing its template_id with a
+// name reference that is portable across projects. The task params inventory
+// is carried by name via TaskParams.InventoryName, like schedules do.
+type BackupWorkflowNode struct {
+	db.WorkflowNode
+	Template *string `backup:"template"`
+}
+
 type BackupEntry interface {
 	GetName() string
 	Verify(backup *BackupFormat) error
-	Restore(store db.Store, b *BackupDB) error
+	Restore(b *BackupDB) error
 }
 
 func (e BackupEnvironment) GetName() string {
@@ -166,5 +200,9 @@ func (e BackupRole) GetName() string {
 }
 
 func (e BackupRunner) GetName() string {
+	return e.Name
+}
+
+func (e BackupWorkflow) GetName() string {
 	return e.Name
 }

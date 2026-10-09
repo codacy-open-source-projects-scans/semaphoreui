@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/handlers"
@@ -14,10 +17,13 @@ import (
 	"github.com/semaphoreui/semaphore/api/sockets"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/db/factory"
+	"github.com/semaphoreui/semaphore/pkg/debuglog"
+	"github.com/semaphoreui/semaphore/pkg/metrics"
 	proFactory "github.com/semaphoreui/semaphore/pro/db/factory"
 	proHA "github.com/semaphoreui/semaphore/pro/services/ha"
 	proServer "github.com/semaphoreui/semaphore/pro/services/server"
 	proTasks "github.com/semaphoreui/semaphore/pro/services/tasks"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/services/schedules"
 	"github.com/semaphoreui/semaphore/services/server"
 	"github.com/semaphoreui/semaphore/services/tasks"
@@ -27,9 +33,10 @@ import (
 )
 
 var persistentFlags struct {
-	configPath string
-	noConfig   bool
-	logLevel   string
+	configPath  string
+	noConfig    bool
+	logLevel    string
+	debugFilter string
 }
 
 var rootCmd = &cobra.Command{
@@ -48,41 +55,140 @@ Complete documentation is available at https://semaphoreui.com.`,
 		if str == "" {
 			str = os.Getenv("SEMAPHORE_LOG_LEVEL")
 		}
-		if str == "" {
-			return
+
+		if str != "" {
+			lvl, err := log.ParseLevel(str)
+			if err != nil {
+				log.Panic(err)
+			}
+
+			fmt.Println("Log level set to", lvl)
+			log.SetLevel(lvl)
 		}
 
-		lvl, err := log.ParseLevel(str)
-		if err != nil {
-			log.Panic(err)
-		}
-
-		fmt.Println("Log level set to", lvl)
-		log.SetLevel(lvl)
+		initDebugFilter()
 	},
 }
 
-func Execute() {
+// initDebugFilter installs a Node.js-`debug`-style namespace filter for DEBUG
+// logs, driven by the --debug-filter flag or SEMAPHORE_DEBUG_FILTER env var.
+// The filter only narrows DEBUG-level output and only takes effect when the log
+// level is already DEBUG; otherwise there are no debug entries to filter and the
+// logger is left untouched.
+func initDebugFilter() {
+	spec, filter := configuredDebugFilter()
+	if filter == nil {
+		return
+	}
+
+	log.SetFormatter(debuglog.NewFilteringFormatter(
+		log.StandardLogger().Formatter,
+		filter,
+	))
+
+	fmt.Println("Debug filter active:", spec)
+}
+
+func configuredDebugFilter() (string, *debuglog.Filter) {
+	spec := persistentFlags.debugFilter
+	if spec == "" {
+		spec = os.Getenv("SEMAPHORE_DEBUG_FILTER")
+	}
+
+	if spec == "" || log.GetLevel() < log.DebugLevel {
+		return "", nil
+	}
+
+	return spec, debuglog.Parse(spec)
+}
+
+// registerPersistentFlags is guarded by a sync.Once because both Execute and
+// RootCommand need the flags present, and pflag panics on a duplicate name.
+var registerPersistentFlags = sync.OnceFunc(func() {
 	rootCmd.PersistentFlags().StringVar(&persistentFlags.logLevel, "log-level", "", "Log level: DEBUG, INFO, WARN, ERROR, FATAL, PANIC")
+	rootCmd.PersistentFlags().StringVar(&persistentFlags.debugFilter, "debug-filter", "", "Debug namespace filter (only with DEBUG level), e.g. 'runner,task_*' or '*,-db'")
 	rootCmd.PersistentFlags().StringVar(&persistentFlags.configPath, "config", "", "Configuration file path")
 	rootCmd.PersistentFlags().BoolVar(&persistentFlags.noConfig, "no-config", false, "Don't use configuration file")
+})
+
+func Execute() {
+	registerPersistentFlags()
 	if err := rootCmd.Execute(); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
+// watchEncryptionKeyReload enables key rotation without restarting the server:
+//   - a SIGHUP forces an immediate reload;
+//   - a background poller applies changes to the encryption-keys file (and the
+//     key files it references) automatically. The poller runs only when a keys
+//     file is configured and the poll interval is positive.
+func watchEncryptionKeyReload() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+	go func() {
+		for range sigCh {
+			if err := util.ReloadEncryptionKeys(); err != nil {
+				log.WithError(err).Error("failed to reload encryption keys")
+			} else {
+				log.Info("encryption keys reloaded (SIGHUP)")
+			}
+		}
+	}()
+
+	interval := util.Config.EncryptionKeysPollInterval()
+	if util.Config.EncryptionKeysFile() == "" || interval <= 0 {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			changed, err := util.ReloadEncryptionKeysIfChanged()
+			if err != nil {
+				log.WithError(err).Error("failed to reload encryption keys")
+			} else if changed {
+				log.Info("encryption keys reloaded (file changed)")
+			}
+		}
+	}()
+}
+
 func runService() {
 	store := createStore("root")
+	defer store.Close()
+
+	watchEncryptionKeyReload()
+
+	jwtSigner, jwtErr := util.InitJWTSignerFromStore(store)
+	if jwtErr != nil {
+		log.WithError(jwtErr).Warning("failed to initialise JWT signer")
+	}
 
 	initSyslog(util.Config.Syslog)
 
 	// Initialize HA node identity before any component that uses it.
 	util.InitHANodeID()
 
+	appMetrics := metrics.NewMetrics()
+
+	auditService, auditErr := audit.StartService(
+		store,
+		util.Config.Audit,
+		util.HANodeID(),
+		proServer.NewAuditExporter(store, util.Config.Audit, proHA.NewAuditExportLeaser(), appMetrics),
+	)
+	if auditErr != nil {
+		log.WithError(auditErr).Fatal("failed to start the audit log")
+	}
+	defer auditService.Stop()
+
 	state := proTasks.NewTaskStateStore()
 	terraformStore := proFactory.NewTerraformStore(store)
 	ansibleTaskRepo := proFactory.NewAnsibleTaskRepository(store)
+	workflowStore := proFactory.NewWorkflowStore(store)
 
 	projectService := server.NewProjectService(store, store)
 	encryptionService := server.NewAccessKeyEncryptionService(store, store, store, store)
@@ -94,10 +200,11 @@ func runService() {
 		store,
 		encryptionService,
 	)
-	accessKeyService := server.NewAccessKeyService(store, encryptionService, store)
+	accessKeyService := server.NewAccessKeyService(store, encryptionService, store, store)
 	secretStorageService := server.NewSecretStorageService(store, store, accessKeyService, encryptionService)
 	secretStorageSyncScheduler := server.NewSecretStorageSyncScheduler(store, secretStorageService)
-	environmentService := server.NewEnvironmentService(store, encryptionService)
+	environmentService := server.NewEnvironmentService(store, encryptionService, store)
+	runnerService := server.NewRunnerService(store)
 	subscriptionService := proServer.NewSubscriptionService(store, store, store, terraformStore)
 	logWriteService := proServer.NewLogWriteService()
 
@@ -109,7 +216,20 @@ func runService() {
 		encryptionService,
 		accessKeyInstallationService,
 		logWriteService,
+		jwtSigner,
+		appMetrics,
 	)
+	taskPool.SetAuditRecorder(auditService.Recorder())
+	taskPool.SetWorkflowRepo(workflowStore)
+
+	// The workflow service orchestrates workflow runs and launches each node's
+	// task through the pool; the pool calls back into it when a workflow task
+	// finishes. Wire the cycle: pool first, then service (with the pool as its
+	// enqueuer), then inject the service back into the pool. The run locker is
+	// Redis-backed in HA mode (cluster-wide progression locks) and nil
+	// otherwise, which makes the service fall back to its in-process locker.
+	workflowService := proServer.NewWorkflowService(workflowStore, store, &taskPool, proHA.NewWorkflowRunLocker())
+	taskPool.SetWorkflowService(workflowService)
 
 	schedulePool := schedules.CreateSchedulePool(
 		store,
@@ -119,6 +239,7 @@ func runService() {
 	)
 
 	defer schedulePool.Destroy()
+	defer taskPool.Stop()
 
 	// --- Active-Active HA Setup ---
 	// When HA is enabled, multiple Semaphore nodes share the same Redis-backed
@@ -134,6 +255,11 @@ func runService() {
 		defer nodeRegistry.Stop()
 		log.WithField("node_id", nodeRegistry.NodeID()).Info("HA active-active mode enabled")
 	}
+
+	// Cluster inspector powers the admin Cluster Dashboard. It is nil when HA
+	// is disabled; the dashboard then falls back to the local task pool. The
+	// instance is injected per-request below.
+	clusterInspector := proHA.NewClusterInspector()
 
 	if dedup := proHA.NewScheduleDeduplicator(); dedup != nil {
 		schedulePool.SetDeduplicator(dedup)
@@ -157,6 +283,15 @@ func runService() {
 	if orphanCleaner := proHA.NewOrphanCleaner(store); orphanCleaner != nil {
 		orphanCleaner.Start()
 		defer orphanCleaner.Stop()
+	}
+
+	// The workflow reconciler periodically progresses non-terminal runs so
+	// approval timeouts fire and statuses converge without a browser poll or a
+	// task completion. Cluster-safe: each pass takes the per-run lock. Nil in
+	// the open-source build (workflows are Pro-gated).
+	if workflowReconciler := proServer.NewWorkflowReconciler(workflowStore, workflowService); workflowReconciler != nil {
+		workflowReconciler.Start()
+		defer workflowReconciler.Stop()
 	}
 
 	util.Config.PrintDbInfo()
@@ -184,6 +319,7 @@ func runService() {
 		defer wsBroadcaster.Stop()
 	}
 
+	taskPool.LogRunnerStateSnapshot()
 	go schedulePool.Run()
 	go taskPool.Run()
 
@@ -193,6 +329,7 @@ func runService() {
 	route := api.Route(
 		store,
 		terraformStore,
+		workflowStore,
 		ansibleTaskRepo,
 		&taskPool,
 		projectService,
@@ -203,6 +340,10 @@ func runService() {
 		accessKeyService,
 		environmentService,
 		subscriptionService,
+		jwtSigner,
+		runnerService,
+		workflowService,
+		appMetrics,
 	)
 
 	route.Use(func(next http.Handler) http.Handler {
@@ -211,6 +352,9 @@ func runService() {
 			r = helpers.SetContextValue(r, "schedule_pool", schedulePool)
 			r = helpers.SetContextValue(r, "task_pool", &taskPool)
 			r = helpers.SetContextValue(r, "log_writer", logWriteService)
+			r = helpers.SetContextValue(r, "cluster_inspector", clusterInspector)
+			r = helpers.SetContextValue(r, "audit", auditService.Recorder())
+
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -218,23 +362,32 @@ func runService() {
 	var router http.Handler = route
 
 	router = handlers.ProxyHeaders(router)
+	// Outside ProxyHeaders, which trusts X-Forwarded-For blindly.
+	router = auditService.Wrap(router)
 	http.Handle("/", router)
 
 	fmt.Println("Server is running")
 
-	if store.PermanentConnection() {
-		defer store.Close("root")
-	} else {
-		store.Close("root")
-	}
-
 	var err error
 	if util.Config.TLS.Enabled {
+
+		if util.Config.TLS.HTTPRedirectPort != nil && util.Config.TLS.HTTPRedirectAddr != "" {
+			panic("You can't use both HTTP redirect address and port at the same time")
+		}
+
+		var httpRedirectAddr string
+
 		if util.Config.TLS.HTTPRedirectPort != nil {
+			httpRedirectAddr = fmt.Sprintf(":%d", *util.Config.TLS.HTTPRedirectPort)
+		} else if util.Config.TLS.HTTPRedirectAddr != "" {
+			httpRedirectAddr = util.Config.TLS.HTTPRedirectAddr
+		}
+
+		if httpRedirectAddr != "" {
 
 			go func() {
-				httpRedirectPort := fmt.Sprintf(":%d", *util.Config.TLS.HTTPRedirectPort)
-				err = http.ListenAndServe(httpRedirectPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+				err = http.ListenAndServe(httpRedirectAddr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					target := "https://"
 
 					if util.Config.WebHost != "" {
@@ -286,7 +439,7 @@ func createStoreWithMigrationVersion(token string, undoTo *string, applyTo *stri
 
 	store := factory.CreateStore()
 
-	store.Connect(token)
+	store.Connect()
 
 	var err error
 	if undoTo != nil {

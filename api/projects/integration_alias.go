@@ -1,11 +1,14 @@
 package projects
 
 import (
+	"net/http"
+	"slices"
+
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pkg/random"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/util"
-	"net/http"
 )
 
 type publicAlias struct {
@@ -70,24 +73,56 @@ func AddIntegrationAlias(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The alias value works as a bearer secret, so only its record ID is recorded.
+	var part audit.IntegrationPartMetadata
+	if integrationId != nil {
+		part.IntegrationID = *integrationId
+	}
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceIntegrationAliasCreate,
+		Target:    audit.ResourceTarget(audit.TargetIntegrationAlias, alias.ID, ""),
+		ProjectID: project.ID,
+		Metadata:  part,
+	})
+
 	helpers.WriteJSON(w, http.StatusOK, getPublicAlias(alias))
 }
 
 func RemoveIntegrationAlias(w http.ResponseWriter, r *http.Request) {
 	project := helpers.GetFromContext(r, "project").(db.Project)
-	aliasID, err := helpers.GetIntParam("alias_id", w, r)
+	aliasID, ok := helpers.GetIntParamOrAbort("alias_id", w, r)
+
+	if !ok {
+		return
+	}
+
+	var part audit.IntegrationPartMetadata
+	if integration, ok := helpers.GetFromContext(r, "integration").(db.Integration); ok {
+		// The store deletes by project, so an alias of another integration is refused here.
+		aliases, err := helpers.Store(r).GetIntegrationAliases(project.ID, &integration.ID)
+		if err != nil {
+			helpers.WriteError(w, err)
+			return
+		}
+		if !slices.ContainsFunc(aliases, func(a db.IntegrationAlias) bool { return a.ID == aliasID }) {
+			helpers.WriteError(w, db.ErrNotFound)
+			return
+		}
+		part.IntegrationID = integration.ID
+	}
+
+	err := helpers.Store(r).DeleteIntegrationAlias(project.ID, aliasID)
 
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
-
-	err = helpers.Store(r).DeleteIntegrationAlias(project.ID, aliasID)
-
-	if err != nil {
-		helpers.WriteError(w, err)
-		return
-	}
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceIntegrationAliasDelete,
+		Target:    audit.ResourceTarget(audit.TargetIntegrationAlias, aliasID, ""),
+		ProjectID: project.ID,
+		Metadata:  part,
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }

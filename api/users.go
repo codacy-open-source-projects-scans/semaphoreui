@@ -2,26 +2,33 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"image/png"
+	"net/http"
+
+	"github.com/gorilla/mux"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pro_interfaces"
+	"github.com/semaphoreui/semaphore/services/audit"
 	log "github.com/sirupsen/logrus"
-	"image/png"
-	"net/http"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/semaphoreui/semaphore/util"
 )
 
 type UsersController struct {
 	subscriptionService pro_interfaces.SubscriptionService
+	log                 *log.Entry
 }
 
 func NewUsersController(subscriptionService pro_interfaces.SubscriptionService) *UsersController {
 	return &UsersController{
 		subscriptionService: subscriptionService,
+		log:                 log.WithField("context", "api.users"),
 	}
 }
 
@@ -66,7 +73,8 @@ func (c *UsersController) AddUser(w http.ResponseWriter, r *http.Request) {
 
 	editor := helpers.GetFromContext(r, "user").(*db.User)
 	if !editor.Admin {
-		log.Warn(editor.Username + " is not permitted to create users")
+		c.log.WithField("editor", editor.Username).Debug("Not permitted to create users")
+		helpers.RecordDenied(r, "admin", 0)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -75,13 +83,17 @@ func (c *UsersController) AddUser(w http.ResponseWriter, r *http.Request) {
 		ok, err := c.subscriptionService.CanAddProUser()
 
 		if err != nil {
+			c.log.WithError(err).Error("Failed to check Pro user limit")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		if !ok {
-			helpers.WriteErrorStatus(w,
-				fmt.Sprintf("You have reached the limit of Pro users for your subscription."), http.StatusForbidden)
+			helpers.WriteErrorStatus(
+				w,
+				"You have reached the limit of Pro users for your subscription.",
+				http.StatusForbidden,
+			)
 			return
 		}
 	}
@@ -96,18 +108,24 @@ func (c *UsersController) AddUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		log.Warn(editor.Username + " is not created: " + err.Error())
+		c.log.WithError(err).WithField("username", user.Username).Error("Failed to create user")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:     audit.IAMUserCreate,
+		Target:   audit.UserTarget(newUser.ID, newUser.Username),
+		Metadata: audit.UserCreateMetadata{Admin: newUser.Admin, Pro: newUser.Pro, External: newUser.External},
+	})
+
 	helpers.WriteJSON(w, http.StatusCreated, newUser)
 }
-func readonlyUserMiddleware(next http.Handler) http.Handler {
+func (c *UsersController) ReadonlyUserMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userID, err := helpers.GetIntParam("user_id", w, r)
+		userID, ok := helpers.GetIntParamOrAbort("user_id", w, r)
 
-		if err != nil {
+		if !ok {
 			return
 		}
 
@@ -133,11 +151,11 @@ func readonlyUserMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func getUserMiddleware(next http.Handler) http.Handler {
+func (c *UsersController) GetUserMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		userID, err := helpers.GetIntParam("user_id", w, r)
+		userID, ok := helpers.GetIntParamOrAbort("user_id", w, r)
 
-		if err != nil {
+		if !ok {
 			return
 		}
 
@@ -151,7 +169,14 @@ func getUserMiddleware(next http.Handler) http.Handler {
 		editor := helpers.GetFromContext(r, "user").(*db.User)
 
 		if !editor.Admin && editor.ID != user.ID {
-			log.Warn(editor.Username + " is not permitted to edit users")
+			c.log.WithFields(log.Fields{
+				"editor":  editor.Username,
+				"user_id": user.ID,
+			}).Debug("Not permitted to access another user")
+			// Reads of another user are not audited, attempts to change them are.
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				helpers.RecordDenied(r, "admin", 0)
+			}
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -171,7 +196,11 @@ func (c *UsersController) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !editor.Admin && (user.Pro && !targetUser.Pro) {
-		log.Warn(editor.Username + " is not permitted to mark users as Pro")
+		c.log.WithFields(log.Fields{
+			"editor":  editor.Username,
+			"user_id": targetUser.ID,
+		}).Debug("Not permitted to mark users as Pro")
+		helpers.RecordDenied(r, "admin", 0)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -180,61 +209,87 @@ func (c *UsersController) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		ok, err := c.subscriptionService.CanAddProUser()
 
 		if err != nil {
+			c.log.WithError(err).Error("Failed to check Pro user limit")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		if !ok {
-			helpers.WriteErrorStatus(w,
-				fmt.Sprintf("You have reached the limit of Pro users for your subscription."), http.StatusForbidden)
+			helpers.WriteErrorStatus(
+				w,
+				"You have reached the limit of Pro users for your subscription.",
+				http.StatusForbidden,
+			)
 			return
 		}
 	}
 
 	if !editor.Admin && editor.ID != targetUser.ID {
-		log.Warn(editor.Username + " is not permitted to edit users")
+		c.log.WithFields(log.Fields{
+			"editor":  editor.Username,
+			"user_id": targetUser.ID,
+		}).Debug("Not permitted to update another user")
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	if editor.ID == targetUser.ID && targetUser.Admin != user.Admin {
-		log.Warn("User can't edit his own role")
+		c.log.WithField("editor", editor.Username).Debug("Not permitted to change own admin status")
+		helpers.RecordDenied(r, "admin", 0)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	if targetUser.External && targetUser.Username != user.Username {
-		log.Warn("Username is not editable for external users")
+		c.log.WithField("user_id", targetUser.ID).Debug("Username is not editable for external users")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	meta := userUpdateMetadata(targetUser, user)
 	user.ID = targetUser.ID
 	if err := helpers.Store(r).UpdateUser(user); err != nil {
-		log.Error(err.Error())
+		c.log.WithError(err).WithField("user_id", targetUser.ID).Error("Failed to update user")
 		w.WriteHeader(http.StatusBadRequest)
 		return
+	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:     audit.IAMUserUpdate,
+		Target:   audit.UserTarget(targetUser.ID, user.Username),
+		Metadata: meta,
+	})
+	if user.Pwd != "" {
+		passwordKind := audit.IAMUserPasswordAdminReset
+		if editor.ID == targetUser.ID {
+			passwordKind = audit.IAMUserPasswordChange
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{Kind: passwordKind, Target: audit.UserTarget(targetUser.ID, user.Username)})
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func updateUserPassword(w http.ResponseWriter, r *http.Request) {
+func (c *UsersController) UpdateUserPassword(w http.ResponseWriter, r *http.Request) {
 	user := helpers.GetFromContext(r, "_user").(db.User)
 	editor := helpers.GetFromContext(r, "user").(*db.User)
 
 	var pwd struct {
-		Pwd string `json:"password"`
+		Pwd        string `json:"password"`
+		CurrentPwd string `json:"current_password"`
 	}
 
 	if !editor.Admin && editor.ID != user.ID {
-		log.Warn(editor.Username + " is not permitted to edit users")
+		c.log.WithFields(log.Fields{
+			"editor":  editor.Username,
+			"user_id": user.ID,
+		}).Debug("Not permitted to change another user's password")
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	if user.External {
-		log.Warn("Password is not editable for external users")
+		c.log.WithField("user_id", user.ID).Debug("Password is not editable for external users")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -243,33 +298,129 @@ func updateUserPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CWE-620: require the current password when a user changes their own,
+	// so a stolen session can't be used to take over the account. Admins
+	// changing someone else's password are exempt — they can't know it.
+	if editor.ID == user.ID {
+		if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(pwd.CurrentPwd)); err != nil {
+			c.log.WithField("user_id", user.ID).Debug("Current password does not match")
+			helpers.Audit(r).Record(r.Context(), audit.Event{
+				Kind:    audit.IAMUserPasswordChange,
+				Outcome: audit.OutcomeFailure,
+				Reason:  audit.ReasonInvalidCurrentPassword,
+				Target:  audit.UserTarget(user.ID, user.Username),
+			})
+			helpers.WriteErrorStatus(w, "Current password is incorrect", http.StatusBadRequest)
+			return
+		}
+	}
+
 	if err := helpers.Store(r).SetUserPassword(user.ID, pwd.Pwd); err != nil {
-		util.LogWarning(err)
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to set user password")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
+	passwordKind := audit.IAMUserPasswordAdminReset
+	if editor.ID == user.ID {
+		passwordKind = audit.IAMUserPasswordChange
+	}
+	helpers.Audit(r).Record(r.Context(), audit.Event{Kind: passwordKind, Target: audit.UserTarget(user.ID, user.Username)})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func deleteUser(w http.ResponseWriter, r *http.Request) {
+func (c *UsersController) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	user := helpers.GetFromContext(r, "_user").(db.User)
 	editor := helpers.GetFromContext(r, "user").(*db.User)
 
 	if !editor.Admin && editor.ID != user.ID {
-		log.Warn(editor.Username + " is not permitted to delete users")
+		c.log.WithFields(log.Fields{
+			"editor":  editor.Username,
+			"user_id": user.ID,
+		}).Debug("Not permitted to delete another user")
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	if err := helpers.Store(r).DeleteUser(user.ID); err != nil {
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to delete user")
 		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{Kind: audit.IAMUserDelete, Target: audit.UserTarget(user.ID, user.Username)})
+
+	if err := helpers.Store(r).DeleteOptions(fmt.Sprintf("user%d", user.ID)); err != nil {
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to delete options of removed user")
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func totpQr(w http.ResponseWriter, r *http.Request) {
+func (c *UsersController) GetUserIdentities(w http.ResponseWriter, r *http.Request) {
+	user := helpers.GetFromContext(r, "_user").(db.User)
+
+	identities, err := helpers.Store(r).GetUserExternalIdentities(user.ID)
+	if err != nil {
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to get user identities")
+		helpers.WriteErrorStatus(w, "Failed to get identities", http.StatusInternalServerError)
+		return
+	}
+
+	helpers.WriteJSON(w, http.StatusOK, identities)
+}
+
+func (c *UsersController) DeleteUserIdentity(w http.ResponseWriter, r *http.Request) {
+	user := helpers.GetFromContext(r, "_user").(db.User)
+	idType := mux.Vars(r)["type"]
+	provider := mux.Vars(r)["provider"]
+
+	if idType != db.IdentityTypeLdap && idType != db.IdentityTypeOidc {
+		helpers.WriteErrorStatus(w, "Invalid identity type", http.StatusBadRequest)
+		return
+	}
+
+	identities, err := helpers.Store(r).GetUserExternalIdentities(user.ID)
+	if err != nil {
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to get user identities")
+		helpers.WriteErrorStatus(w, "Failed to delete identity", http.StatusInternalServerError)
+		return
+	}
+	// Only block unlinking when the requested identity exists and it is the last one.
+	targetExists := false
+	for _, identity := range identities {
+		if identity.Type == idType && identity.Provider == provider {
+			targetExists = true
+			break
+		}
+	}
+	if user.External && targetExists && len(identities) <= 1 {
+		helpers.WriteErrorStatus(w, errCannotUnlinkLastIdentity.Error(), http.StatusConflict)
+		return
+	}
+
+	err = helpers.Store(r).DeleteExternalIdentity(user.ID, idType, provider)
+	if errors.Is(err, db.ErrNotFound) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err != nil {
+		c.log.WithError(err).WithField("user_id", user.ID).Error("Failed to delete user identity")
+		helpers.WriteErrorStatus(w, "Failed to delete identity", http.StatusInternalServerError)
+		return
+	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:     audit.IAMExternalIdentityUnlink,
+		Target:   audit.UserTarget(user.ID, user.Username),
+		Metadata: audit.AuthMethodMetadata{Method: idType, Provider: provider},
+	})
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *UsersController) TotpQr(w http.ResponseWriter, r *http.Request) {
 	user := helpers.GetFromContext(r, "_user").(db.User)
 
 	if user.Totp == nil {
@@ -297,14 +448,16 @@ func totpQr(w http.ResponseWriter, r *http.Request) {
 	}
 	pngBytes := buf.Bytes()
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{Kind: audit.IAMMFAViewQR, Target: audit.UserTarget(user.ID, user.Username)})
+
 	w.Header().Add("Content-Type", "image/png")
-	_, err = w.Write(pngBytes)
+	_, _ = w.Write(pngBytes)
 }
 
-func enableTotp(w http.ResponseWriter, r *http.Request) {
+func (c *UsersController) EnableTotp(w http.ResponseWriter, r *http.Request) {
 	user := helpers.GetFromContext(r, "_user").(db.User)
 
-	if !util.Config.Auth.Totp.Enabled {
+	if !util.Config.Mfa.Totp.Enabled {
 		helpers.WriteErrorStatus(w, "TOTP not enabled", http.StatusBadRequest)
 		return
 	}
@@ -320,13 +473,14 @@ func enableTotp(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err != nil {
+		c.log.WithError(err).WithFields(log.Fields{"user_id": user.ID}).Error("Failed to generate TOTP key")
 		http.Error(w, "Error generating key", http.StatusInternalServerError)
 		return
 	}
 
 	var code, hash string
 
-	if util.Config.Auth.Totp.AllowRecovery {
+	if util.Config.Mfa.Totp.AllowRecovery {
 		code, hash, err = util.GenerateRecoveryCode()
 		if err != nil {
 			helpers.WriteError(w, err)
@@ -342,27 +496,62 @@ func enableTotp(w http.ResponseWriter, r *http.Request) {
 
 	newTotp.RecoveryCode = code
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{Kind: audit.IAMMFAEnable, Target: audit.UserTarget(user.ID, user.Username)})
+
 	helpers.WriteJSON(w, http.StatusOK, newTotp)
 }
 
-func disableTotp(w http.ResponseWriter, r *http.Request) {
+func (c *UsersController) DisableTotp(w http.ResponseWriter, r *http.Request) {
 	user := helpers.GetFromContext(r, "_user").(db.User)
 	if user.Totp == nil {
 		helpers.WriteErrorStatus(w, "TOTP not enabled", http.StatusBadRequest)
 		return
 	}
 
-	totpID, err := helpers.GetIntParam("totp_id", w, r)
+	totpID, ok := helpers.GetIntParamOrAbort("totp_id", w, r)
+	if !ok {
+		return
+	}
+
+	err := helpers.Store(r).DeleteTotpVerification(user.ID, totpID)
+	if errors.Is(err, db.ErrNotFound) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
 
-	err = helpers.Store(r).DeleteTotpVerification(user.ID, totpID)
-	if err != nil {
-		helpers.WriteError(w, err)
-		return
-	}
+	helpers.Audit(r).Record(r.Context(), audit.Event{Kind: audit.IAMMFADisable, Target: audit.UserTarget(user.ID, user.Username)})
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func userUpdateMetadata(before db.User, after db.UserWithPwd) audit.UserUpdateMetadata {
+	meta := audit.UserUpdateMetadata{Fields: []string{}}
+	if before.Username != after.Username {
+		meta.Fields = append(meta.Fields, "username")
+	}
+	if before.Name != after.Name {
+		meta.Fields = append(meta.Fields, "name")
+	}
+	if before.Email != after.Email {
+		meta.Fields = append(meta.Fields, "email")
+	}
+	if before.Alert != after.Alert {
+		meta.Fields = append(meta.Fields, "alert")
+	}
+	if before.Admin != after.Admin {
+		meta.Fields = append(meta.Fields, "admin")
+		meta.Admin = &audit.BoolChange{Old: before.Admin, New: after.Admin}
+	}
+	if before.Pro != after.Pro {
+		meta.Fields = append(meta.Fields, "pro")
+		meta.Pro = &audit.BoolChange{Old: before.Pro, New: after.Pro}
+	}
+	if after.Pwd != "" {
+		meta.Fields = append(meta.Fields, "password")
+	}
+	return meta
 }

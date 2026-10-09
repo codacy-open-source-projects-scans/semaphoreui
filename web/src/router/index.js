@@ -18,6 +18,7 @@ import Environment from '../views/project/Environment.vue';
 import Inventory from '../views/project/Inventory.vue';
 import Keys from '../views/project/Keys.vue';
 import Repositories from '../views/project/Repositories.vue';
+import HostConfig from '../views/project/HostConfig.vue';
 import Team from '../views/project/Team.vue';
 import Users from '../views/Users.vue';
 import Auth from '../views/Auth.vue';
@@ -26,10 +27,17 @@ import Integrations from '../views/project/Integrations.vue';
 import IntegrationExtractor from '../views/project/IntegrationExtractor.vue';
 import Apps from '../views/Apps.vue';
 import Runners from '../views/Runners.vue';
+import Cluster from '../views/Cluster.vue';
 import Stats from '../views/project/Stats.vue';
 import Tokens from '../views/Tokens.vue';
 import AcceptInvite from '../views/AcceptInvite.vue';
 import SecretStorage from '../views/project/SecretStorages.vue';
+import Workflows from '../views/project/Workflows.vue';
+import WorkflowView from '../views/project/WorkflowView.vue';
+import WorkflowRuns from '../views/project/workflow/WorkflowRuns.vue';
+import WorkflowStats from '../views/project/workflow/WorkflowStats.vue';
+import WorkflowRun from '../views/project/WorkflowRun.vue';
+import WorkflowEditor from '../views/project/WorkflowEditor.vue';
 
 Vue.use(VueRouter);
 
@@ -77,6 +85,34 @@ const routes = [
   {
     path: '/project/:projectId/templates',
     component: Templates,
+  },
+  {
+    path: '/project/:projectId/workflows',
+    component: Workflows,
+  },
+  {
+    path: '/project/:projectId/workflows/new',
+    component: WorkflowEditor,
+  },
+  {
+    path: '/project/:projectId/workflows/:workflowId/edit',
+    component: WorkflowEditor,
+  },
+  {
+    path: '/project/:projectId/workflows/:workflowId/runs/:runId',
+    component: WorkflowRun,
+  },
+  {
+    path: '/project/:projectId/workflows/:workflowId',
+    redirect: '/project/:projectId/workflows/:workflowId/runs',
+    component: WorkflowView,
+    children: [{
+      path: 'runs',
+      component: WorkflowRuns,
+    }, {
+      path: 'stats',
+      component: WorkflowStats,
+    }],
   },
   {
     path: '/project/:projectId/views/:viewId/templates',
@@ -139,6 +175,10 @@ const routes = [
     component: Repositories,
   },
   {
+    path: '/project/:projectId/host_config',
+    component: HostConfig,
+  },
+  {
     path: '/project/:projectId/keys',
     component: Keys,
   },
@@ -169,6 +209,10 @@ const routes = [
   {
     path: '/runners',
     component: Runners,
+  },
+  {
+    path: '/cluster',
+    component: Cluster,
   },
   {
     path: '/tasks',

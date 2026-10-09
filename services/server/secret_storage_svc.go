@@ -60,31 +60,28 @@ func (s *SecretStorageServiceImpl) Delete(projectID int, storageID int) (err err
 		}
 
 		for _, key := range syncedKeys {
-			if err = s.accessKeyRepo.DeleteAccessKey(projectID, key.ID); err != nil {
+			if err = s.accessKeyRepo.DeleteAccessKey(projectID, key.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
 				return
 			}
 		}
 	}
 
-	err = s.secretStorageRepo.DeleteSecretStorage(projectID, storageID)
-	if err != nil {
-		return
-	}
-
+	// Deleted before the storage row: MySQL 8 ignores the inline access_key.storage_id cascade.
 	keys, err := s.accessKeyService.GetAll(projectID, db.GetAccessKeyOptions{
 		Owner:     db.AccessKeySecretStorage,
 		StorageID: &storageID,
 	}, db.RetrieveQueryParams{})
-
 	if err != nil {
 		return
 	}
 
 	for _, key := range keys {
-		err = s.accessKeyService.Delete(projectID, key.ID)
+		if err = s.accessKeyService.Delete(projectID, key.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
+			return
+		}
 	}
 
-	return
+	return s.secretStorageRepo.DeleteSecretStorage(projectID, storageID)
 }
 
 func (s *SecretStorageServiceImpl) GetSecretStorage(projectID int, storageID int) (res db.SecretStorage, err error) {
@@ -94,6 +91,12 @@ func (s *SecretStorageServiceImpl) GetSecretStorage(projectID int, storageID int
 func (s *SecretStorageServiceImpl) Create(storage db.SecretStorage) (res db.SecretStorage, err error) {
 	sourceStorageType := storage.SourceStorageType
 	sourceStorageKey := ""
+
+	if !pro.StorageRequiresSecret(storage) {
+		// The storage authenticates without credentials stored in Semaphore
+		// (for example an AWS IAM role), so no access key is created.
+		return s.secretStorageRepo.CreateSecretStorage(storage)
+	}
 
 	if storage.Secret == "" {
 		err = common_errors.NewUserErrorS("secret must be set")
@@ -139,6 +142,20 @@ func (s *SecretStorageServiceImpl) Create(storage db.SecretStorage) (res db.Secr
 }
 
 func (s *SecretStorageServiceImpl) Update(storage db.SecretStorage) (err error) {
+	sourceStorageType := storage.SourceStorageType
+	sourceStorageKey := ""
+
+	// Checked before the write, so a refused source leaves the storage unchanged.
+	if pro.StorageRequiresSecret(storage) && sourceStorageType != nil {
+		switch *sourceStorageType {
+		case db.AccessKeySourceStorageEnv, db.AccessKeySourceStorageFile:
+			sourceStorageKey = storage.Secret
+		default:
+			err = common_errors.NewUserErrorS("unsupported source storage type")
+			return
+		}
+	}
+
 	err = s.secretStorageRepo.UpdateSecretStorage(storage)
 	if err != nil {
 		return
@@ -153,24 +170,22 @@ func (s *SecretStorageServiceImpl) Update(storage db.SecretStorage) (err error) 
 		return
 	}
 
+	if !pro.StorageRequiresSecret(storage) {
+		// The storage switched to ambient credentials (for example an AWS IAM
+		// role), so previously stored credentials are removed.
+		for _, key := range keys {
+			if err = s.accessKeyService.Delete(storage.ProjectID, key.ID); err != nil {
+				return
+			}
+		}
+		return
+	}
+
 	if len(keys) == 0 {
 		if storage.Secret == "" {
 			// empty vault token means the user didn't set a new token,
 			// so we don't create a new access key.
 			return
-		}
-
-		sourceStorageType := storage.SourceStorageType
-		sourceStorageKey := ""
-
-		if sourceStorageType != nil {
-			switch *sourceStorageType {
-			case db.AccessKeySourceStorageEnv, db.AccessKeySourceStorageFile:
-				sourceStorageKey = storage.Secret
-			default:
-				err = errors.New("unsupported source storage type")
-				return
-			}
 		}
 
 		newKey := db.AccessKey{
@@ -198,19 +213,6 @@ func (s *SecretStorageServiceImpl) Update(storage db.SecretStorage) (err error) 
 
 			//err = s.keyRepo.DeleteAccessKey(storage.ProjectID, vault.ID)
 			return
-		}
-
-		sourceStorageType := storage.SourceStorageType
-		sourceStorageKey := ""
-
-		if sourceStorageType != nil {
-			switch *sourceStorageType {
-			case db.AccessKeySourceStorageEnv, db.AccessKeySourceStorageFile:
-				sourceStorageKey = storage.Secret
-			default:
-				err = errors.New("unsupported source storage type")
-				return
-			}
 		}
 
 		vault.OverrideSecret = true

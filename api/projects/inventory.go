@@ -7,6 +7,7 @@ import (
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/services/audit"
 
 	"os"
 	"path/filepath"
@@ -17,8 +18,8 @@ import (
 func InventoryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		project := helpers.GetFromContext(r, "project").(db.Project)
-		inventoryID, err := helpers.GetIntParam("inventory_id", w, r)
-		if err != nil {
+		inventoryID, ok := helpers.GetIntParamOrAbort("inventory_id", w, r)
+		if !ok {
 			return
 		}
 
@@ -126,6 +127,12 @@ func AddInventory(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Inventory %s created", inventory.Name),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceInventoryCreate,
+		Target:    audit.ResourceTarget(audit.TargetInventory, newInventory.ID, newInventory.Name),
+		ProjectID: project.ID,
+	})
+
 	helpers.WriteJSON(w, http.StatusCreated, newInventory)
 }
 
@@ -207,13 +214,19 @@ func UpdateInventory(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Inventory %s updated", inventory.Name),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceInventoryUpdate,
+		Target:    audit.ResourceTarget(audit.TargetInventory, oldInventory.ID, inventory.Name),
+		ProjectID: oldInventory.ProjectID,
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // RemoveInventory deletes an inventory from the database
 func RemoveInventory(w http.ResponseWriter, r *http.Request) {
 	inventory := helpers.GetFromContext(r, "inventory").(db.Inventory)
-	var err error = helpers.Store(r).DeleteInventory(inventory.ProjectID, inventory.ID)
+	err := helpers.Store(r).DeleteInventory(inventory.ProjectID, inventory.ID)
 	if errors.Is(err, db.ErrInvalidOperation) {
 		helpers.WriteJSON(w, http.StatusBadRequest, map[string]any{
 			"error": "Inventory is in use by one or more templates",
@@ -233,6 +246,12 @@ func RemoveInventory(w http.ResponseWriter, r *http.Request) {
 		ObjectType:  db.EventInventory,
 		ObjectID:    inventory.ID,
 		Description: fmt.Sprintf("Inventory %s deleted", inventory.Name),
+	})
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceInventoryDelete,
+		Target:    audit.ResourceTarget(audit.TargetInventory, inventory.ID, inventory.Name),
+		ProjectID: inventory.ProjectID,
 	})
 
 	w.WriteHeader(http.StatusNoContent)

@@ -3,17 +3,20 @@ package db
 import (
 	"strconv"
 	"strings"
+
+	"github.com/semaphoreui/semaphore/pkg/common_errors"
 )
 
 type IntegrationAuthMethod string
 
 const (
-	IntegrationAuthNone      = ""
-	IntegrationAuthGitHub    = "github"
-	IntegrationAuthToken     = "token"
-	IntegrationAuthHmac      = "hmac"
-	IntegrationAuthBitbucket = "bitbucket"
-	IntegrationAuthBasic     = "basic"
+	IntegrationAuthNone       = ""
+	IntegrationAuthGitHub     = "github"
+	IntegrationAuthToken      = "token"
+	IntegrationAuthHmac       = "hmac"
+	IntegrationAuthHmacSha512 = "hmac-sha512"
+	IntegrationAuthBitbucket  = "bitbucket"
+	IntegrationAuthBasic      = "basic"
 )
 
 type IntegrationMatchType string
@@ -114,26 +117,26 @@ func (alias IntegrationAlias) ToAlias() Alias {
 
 func (env *Integration) Validate() error {
 	if env.Name == "" {
-		return &ValidationError{"No Name set for integration"}
+		return common_errors.NewValidationError("No Name set for integration")
 	}
 	return nil
 }
 
 func (env *IntegrationMatcher) Validate() error {
 	if env.MatchType == "" {
-		return &ValidationError{"No Match Type set"}
+		return common_errors.NewValidationError("No Match Type set")
 	} else {
 		if env.Key == "" {
-			return &ValidationError{"No key set"}
+			return common_errors.NewValidationError("No key set")
 		}
 		if env.Value == "" {
-			return &ValidationError{"No value set"}
+			return common_errors.NewValidationError("No value set")
 		}
 
 	}
 
 	if env.Name == "" {
-		return &ValidationError{"No Name set for integration"}
+		return common_errors.NewValidationError("No Name set for integration")
 	}
 
 	return nil
@@ -141,28 +144,28 @@ func (env *IntegrationMatcher) Validate() error {
 
 func (env *IntegrationExtractValue) Validate() error {
 	if env.ValueSource == "" {
-		return &ValidationError{"No Value Source defined"}
+		return common_errors.NewValidationError("No Value Source defined")
 	}
 
 	if env.Name == "" {
-		return &ValidationError{"No Name set for integration"}
+		return common_errors.NewValidationError("No Name set for integration")
 	}
 
 	if env.ValueSource == IntegrationExtractBodyValue {
 		if env.BodyDataType == "" {
-			return &ValidationError{"Value Source but no body data type set"}
+			return common_errors.NewValidationError("Value Source but no body data type set")
 		}
 
 		if env.BodyDataType == IntegrationBodyDataJSON {
 			if env.Key == "" {
-				return &ValidationError{"No Key set for JSON Body Data extraction."}
+				return common_errors.NewValidationError("No Key set for JSON Body Data extraction.")
 			}
 		}
 	}
 
 	if env.ValueSource == IntegrationExtractHeaderValue {
 		if env.Key == "" {
-			return &ValidationError{"Value Source set but no Key set"}
+			return common_errors.NewValidationError("Value Source set but no Key set")
 		}
 	}
 

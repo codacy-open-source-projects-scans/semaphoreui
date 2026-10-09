@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"os"
+
 	"github.com/mdp/qrterminal/v3"
 	"github.com/pquerna/otp/totp"
+	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/util"
 	"github.com/spf13/cobra"
-	"os"
 )
 
 func init() {
@@ -37,7 +40,7 @@ var totpEnableCmd = &cobra.Command{
 		}
 
 		store := createStore("")
-		defer store.Close("")
+		defer store.Close()
 
 		user, err := store.GetUserByLoginOrEmail(targetUserArgs.login, "")
 
@@ -51,8 +54,8 @@ var totpEnableCmd = &cobra.Command{
 		}
 
 		issuer := "Semaphore"
-		if util.Config.Auth.Totp.Issuer != "" {
-			issuer = util.Config.Auth.Totp.Issuer
+		if util.Config.Mfa.Totp.Issuer != "" {
+			issuer = util.Config.Mfa.Totp.Issuer
 		}
 
 		key, err := totp.Generate(totp.GenerateOpts{
@@ -101,7 +104,7 @@ var totpDisableCmd = &cobra.Command{
 		}
 
 		store := createStore("")
-		defer store.Close("")
+		defer store.Close()
 
 		user, err := store.GetUserByLoginOrEmail(targetUserArgs.login, "")
 
@@ -115,7 +118,7 @@ var totpDisableCmd = &cobra.Command{
 		}
 
 		err = store.DeleteTotpVerification(user.ID, user.Totp.ID)
-		if err != nil {
+		if err != nil && !errors.Is(err, db.ErrNotFound) {
 			panic(err)
 		}
 	},
@@ -131,7 +134,7 @@ var totpShowCmd = &cobra.Command{
 		}
 
 		store := createStore("")
-		defer store.Close("")
+		defer store.Close()
 
 		user, err := store.GetUserByLoginOrEmail(targetUserArgs.login, "")
 

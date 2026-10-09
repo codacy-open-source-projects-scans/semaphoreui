@@ -163,7 +163,8 @@ const BASE_FIELDS = {
     label: 'repository',
   },
   environment: {
-    label: 'environment3',
+    label: 'environment',
+    optional: true,
   },
   git_branch: {
     label: 'branch',
@@ -199,8 +200,26 @@ export const ANSIBLE_FIELDS = {
   allow_override_skip_tags: {
     label: 'skipTags',
   },
+  skip_galaxy_install: {
+    label: 'skipGalaxyInstall',
+  },
+  galaxy_role_args: {
+    label: 'galaxyRoleArgs',
+  },
+  galaxy_collection_args: {
+    label: 'galaxyCollectionArgs',
+  },
+  allow_override_skip_galaxy_install: {
+    label: 'skipGalaxyInstall',
+  },
   allow_override_inventory: {
     label: 'allowInventoryInTask',
+  },
+  hide_dry_run: {
+    label: 'dryRun',
+  },
+  hide_diff: {
+    label: 'diff',
   },
 };
 
@@ -209,6 +228,8 @@ export const TERRAFORM_FIELDS = {
   playbook: {
     label: 'Subdirectory path (Optional)',
     optional: true,
+    // The field names a directory, so the picker lists one level at a time.
+    directories: true,
   },
   inventory: {
     label: 'Workspace (Optional)',
@@ -241,12 +262,20 @@ export const UNKNOWN_APP_FIELDS = {
   inventory: undefined,
 };
 
+// Pulumi runs a directory like the terraform family, but shares none of their
+// other options, so only the path field is taken from them.
+export const PULUMI_FIELDS = {
+  ...UNKNOWN_APP_FIELDS,
+  playbook: TERRAFORM_FIELDS.playbook,
+};
+
 export const APP_FIELDS = {
   '': ANSIBLE_FIELDS,
   ansible: ANSIBLE_FIELDS,
   terraform: TERRAFORM_FIELDS,
   tofu: TERRAFORM_FIELDS,
   terragrunt: TERRAFORM_FIELDS,
+  pulumi: PULUMI_FIELDS,
 };
 
 export const ROLE_PERMISSIONS = {

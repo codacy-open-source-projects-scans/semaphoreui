@@ -22,19 +22,38 @@
       :color="$vuetify.theme.dark ? '#212121' : 'white'"
       style="background: #8585850f"
     >
-      <v-tabs
-          fixed-tabs
-          v-model="sourceStorageTypeIndex"
-      >
+      <v-tabs fixed-tabs v-model="sourceStorageTypeIndex">
+        <v-tab :disabled="formSaving || !canEditSecrets || isSynced" style="padding: 0"
+          >Local</v-tab
+        >
         <v-tab
-            :disabled="formSaving || !canEditSecrets || isSynced" style="padding: 0">Local</v-tab>
-        <v-tab
-            :disabled="formSaving || !canEditSecrets || isSynced" style="padding: 0">Storage</v-tab>
+          v-if="isPro"
+          :disabled="formSaving || !canEditSecrets || isSynced"
+          style="padding: 0"
+          >
+            Storage
+          </v-tab
+        >
         <v-tab :disabled="formSaving || !canEditSecrets || isSynced" style="padding: 0">Env</v-tab>
         <v-tab :disabled="formSaving || !canEditSecrets || isSynced" style="padding: 0">File</v-tab>
       </v-tabs>
 
-      <div class="ml-4 mr-4 mt-6" v-if="sourceStorageType">
+      <div
+        :class="!supportStorages && sourceStorageType === 'vault' ? '' : 'ml-4 mr-4 mt-6'"
+        v-if="sourceStorageType"
+      >
+        <v-alert
+          text
+          color="hsl(348deg, 86%, 61%)"
+          class="PageAlert PageAlert--flat-top"
+          v-if="!supportStorages && sourceStorageType === 'vault'"
+        >
+          <span v-html="$t('project_runners_only_pro')"></span>
+          <v-btn dark class="ml-2" color="hsl(348deg, 86%, 61%)" @click="upgradeToPro()">
+            {{ $t('upgrade_to_pro') }}
+          </v-btn>
+        </v-alert>
+
         <v-autocomplete
           v-if="supportStorages && sourceStorageType === 'vault'"
           v-model="item.source_storage_id"
@@ -58,7 +77,7 @@
         />
 
         <v-text-field
-          v-if="supportStorages && ['env', 'file'].includes(sourceStorageType)"
+          v-if="['env', 'file'].includes(sourceStorageType)"
           v-model="item.source_storage_key"
           :label="
             sourceStorageType === 'env' ? $t('Environment variable name') : $t('Path to the file')
@@ -131,19 +150,70 @@
       dense
     />
 
+    <v-checkbox
+      v-model="item.generate_ssh_key"
+      label="Generate SSH Key"
+      v-if="!isReadOnly && item.type === 'ssh'"
+      :disabled="formSaving || !canEditSecrets"
+      class="mt-0 mb-3"
+      hide-details
+    />
+
     <v-textarea
       outlined
       v-model="item.ssh.private_key"
       :label="$t('privateKey')"
-      :disabled="formSaving || !canEditSecrets"
-      :rules="[(v) => !canEditSecrets || !!v || $t('private_key_required')]"
+      :disabled="formSaving || !canEditSecrets || item.generate_ssh_key"
+      :rules="
+        [
+          (v) => !canEditSecrets || item.generate_ssh_key || !!v || $t('private_key_required')
+        ]"
       v-if="!isReadOnly && item.type === 'ssh'"
     />
 
+    <div
+      v-if="!item.override_secret && item.type === 'ssh' && !isNew && hasGeneratedPublicKey"
+      class="mb-4"
+    >
+      <div class="pb-1">Public key:</div>
+      <div style="position: relative">
+        <pre
+          style="
+            overflow: hidden;
+            background: gray;
+            color: white;
+            border-radius: 10px;
+            margin-top: 0;
+            white-space: normal;
+            height: 35px;
+          "
+          :style="{height: showPublicKey ? 'auto' : '35px' }"
+          class="pa-2"
+          >{{ publicKey }}</pre
+        >
+
+        <v-btn
+          style="position: absolute; right: 40px; top: 0; transform: scale(0.9);"
+          text
+          @click="showPublicKey = !showPublicKey"
+        >
+          {{ showPublicKey ? 'Hide' : 'Show' }}
+        </v-btn>
+
+        <CopyClipboardButton
+          style="position: absolute; right: 0; top: 0; transform: scale(0.9);"
+          :text="publicKey"
+        />
+      </div>
+    </div>
+
     <v-checkbox
+        style="position: absolute; bottom: 18px;"
         v-model="item.override_secret"
         :label="$t('override')"
         v-if="!isNew"
+        hide-details
+        class="mt-0"
     />
 
     <v-alert dense text type="info" v-if="item.type === 'none'">
@@ -153,8 +223,13 @@
 </template>
 <script>
 import ItemFormBase from '@/components/ItemFormBase';
+import CopyClipboardButton from '@/components/CopyClipboardButton.vue';
 
 export default {
+  components: {
+    CopyClipboardButton,
+  },
+
   mixins: [ItemFormBase],
 
   props: {
@@ -181,10 +256,30 @@ export default {
       ],
       secretStorages: null,
       isSynced: false,
+      showPublicKey: false,
     };
   },
 
   computed: {
+    hasGeneratedPublicKey() {
+      return this.publicKey !== '';
+    },
+
+    publicKey: {
+      get() {
+        try {
+          const plain = JSON.parse(this.item?.plain || '{}');
+          return plain.public_key || '';
+        } catch (e) {
+          return '';
+        }
+      },
+    },
+
+    isPro() {
+      return (process.env.VUE_APP_BUILD_TYPE || '').startsWith('pro_');
+    },
+
     sourceStorageType() {
       return this.item?.source_storage_type;
     },
@@ -242,10 +337,20 @@ export default {
       this.isSynced = JSON.parse(this.item.plain || '{}').dvls_id != null;
     },
 
+    beforeSave() {
+      // The checkbox is hidden for non-ssh types and read-only storages but
+      // keeps its value, and the server rejects generate_ssh_key in both cases.
+      // Generation only makes sense when the secret is being overridden.
+      if (this.item.type !== 'ssh' || this.isReadOnly || (!this.isNew && !this.item.override_secret)) {
+        this.item.generate_ssh_key = false;
+      }
+    },
+
     getNewItem() {
       return {
         ssh: {},
         login_password: {},
+        generate_ssh_key: false,
       };
     },
 

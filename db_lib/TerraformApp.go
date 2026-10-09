@@ -1,6 +1,7 @@
 package db_lib
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -94,7 +95,7 @@ func (t *TerraformApp) makeCmd(command string, args []string, environmentVars []
 		}
 	}
 
-	cmd := exec.Command(command, args...) //nolint: gas
+	cmd := exec.Command(command, args...) //nolint:gosec
 	cmd.Dir = t.GetFullPath()
 
 	cmd.Env = getEnvironmentVars()
@@ -112,7 +113,8 @@ func (t *TerraformApp) makeCmd(command string, args []string, environmentVars []
 
 func (t *TerraformApp) runCmd(command string, args []string) error {
 	cmd := t.makeCmd(command, args, nil)
-	t.Logger.LogCmd(cmd)
+	finishLog := t.Logger.LogCmd(cmd)
+	defer finishLog()
 	return cmd.Run()
 }
 
@@ -136,7 +138,15 @@ func (t *TerraformApp) init(environmentVars []string, keyInstaller AccessKeyInst
 	if err != nil {
 		return err
 	}
-	defer keyInstallation.Destroy() //nolint: errcheck
+
+	defer func() {
+		if err := keyInstallation.Destroy(); err != nil {
+			log.WithFields(log.Fields{
+				"context": "app.terraform.init",
+				"key_id":  t.Inventory.SSHKey.ID,
+			}).WithError(err).Error("failed to destroy key")
+		}
+	}()
 
 	args := []string{"init", "-lock=false"}
 
@@ -157,7 +167,8 @@ func (t *TerraformApp) init(environmentVars []string, keyInstaller AccessKeyInst
 
 	cmd := t.makeCmd(t.Name, args, environmentVars)
 	cmd.Env = append(cmd.Env, keyInstallation.GetGitEnv()...)
-	t.Logger.LogCmd(cmd)
+	finishLog := t.Logger.LogCmd(cmd)
+	defer finishLog()
 
 	t.Logger.AddLogListener(func(new time.Time, msg string) {
 		s := strings.TrimSpace(msg)
@@ -180,7 +191,6 @@ func (t *TerraformApp) init(environmentVars []string, keyInstaller AccessKeyInst
 		return err
 	}
 
-	t.Logger.WaitLog()
 	return nil
 }
 
@@ -189,11 +199,8 @@ func (t *TerraformApp) isWorkspacesSupported(environmentVars []string) bool {
 
 	cmd := t.makeCmd(t.Name, args, environmentVars)
 	err := cmd.Run()
-	if err != nil {
-		return false
-	}
 
-	return true
+	return err == nil
 }
 
 func (t *TerraformApp) selectWorkspace(workspace string, environmentVars []string) error {
@@ -219,7 +226,8 @@ func (t *TerraformApp) selectWorkspace(workspace string, environmentVars []strin
 		args = append(tgArgs, args...)
 	}
 	cmd := t.makeCmd(t.Name, args, environmentVars)
-	t.Logger.LogCmd(cmd)
+	finishLog := t.Logger.LogCmd(cmd)
+	defer finishLog()
 
 	err := cmd.Start()
 	if err != nil {
@@ -231,7 +239,6 @@ func (t *TerraformApp) selectWorkspace(workspace string, environmentVars []strin
 		return err
 	}
 
-	t.Logger.WaitLog()
 	return nil
 }
 
@@ -290,18 +297,22 @@ func (t *TerraformApp) InstallRequirementsWithInitArgs(args LocalAppInstallingAr
 	}
 
 	if !t.isWorkspacesSupported(args.EnvironmentVars) {
+		t.Logger.Log("Workspaces are not supported, skipping workspace selection")
 		return
 	}
 
+	t.Logger.Logf("Selecting workspace \"%s\"", workspace)
 	err = t.selectWorkspace(workspace, args.EnvironmentVars)
 	return
 }
 
-func (t *TerraformApp) Plan(args []string, environmentVars []string, inputs map[string]string, cb func(*os.Process)) error {
+func (t *TerraformApp) Plan(args []string, environmentVars []string, inputs map[string]string, stopCh <-chan struct{}) error {
 	planArgs := []string{"plan", "-lock=false"}
 	planArgs = append(planArgs, args...)
 	cmd := t.makeCmd(t.Name, planArgs, environmentVars)
-	t.Logger.LogCmd(cmd)
+	cmd.WaitDelay = 250 * time.Millisecond
+	finishLog := t.Logger.LogCmd(cmd)
+	defer finishLog()
 
 	t.reader.logger.AddLogListener(func(new time.Time, msg string) {
 		if strings.Contains(msg, "No changes.") {
@@ -310,41 +321,30 @@ func (t *TerraformApp) Plan(args []string, environmentVars []string, inputs map[
 	})
 
 	cmd.Stdin = strings.NewReader("")
-	err := cmd.Start()
-	if err != nil {
-		return err
+	err := runCommand(cmd, stopCh, t.Logger)
+	finishLog()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		t.Logger.Logf("terraform command output draining exceeded %s and was stopped", cmd.WaitDelay)
+		return nil
 	}
-
-	cb(cmd.Process)
-
-	err = cmd.Wait()
-	if err != nil {
-		return err
-	}
-
-	t.Logger.WaitLog()
-	return nil
+	return err
 }
 
-func (t *TerraformApp) Apply(args []string, environmentVars []string, inputs map[string]string, cb func(*os.Process)) error {
+func (t *TerraformApp) Apply(args []string, environmentVars []string, inputs map[string]string, stopCh <-chan struct{}) error {
 	applyArgs := []string{"apply", "-auto-approve", "-lock=false"}
 	applyArgs = append(applyArgs, args...)
 	cmd := t.makeCmd(t.Name, applyArgs, environmentVars)
-	t.Logger.LogCmd(cmd)
+	cmd.WaitDelay = 250 * time.Millisecond
+	finishLog := t.Logger.LogCmd(cmd)
+	defer finishLog()
 	cmd.Stdin = strings.NewReader("")
-	err := cmd.Start()
-	if err != nil {
-		return err
+	err := runCommand(cmd, stopCh, t.Logger)
+	finishLog()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		t.Logger.Logf("terraform command output draining exceeded %s and was stopped", cmd.WaitDelay)
+		return nil
 	}
-	cb(cmd.Process)
-
-	err = cmd.Wait()
-	if err != nil {
-		return err
-	}
-
-	t.Logger.WaitLog()
-	return nil
+	return err
 }
 
 func (t *TerraformApp) Run(args LocalAppRunningArgs) error {
@@ -367,9 +367,17 @@ func (t *TerraformApp) Run(args LocalAppRunningArgs) error {
 		applyArgs = defaultArgs
 	}
 
-	err := t.Plan(planArgs, args.EnvironmentVars, args.Inputs, args.Callback)
+	err := t.Plan(planArgs, args.EnvironmentVars, args.Inputs, args.StopCh)
 	if err != nil {
 		return err
+	}
+
+	// A plan may handle SIGTERM and exit successfully; do not interpret that as
+	// normal completion or continue to the next Terraform stage.
+	select {
+	case <-args.StopCh:
+		return nil
+	default:
 	}
 
 	params := args.TaskParams.(*db.TerraformTaskParams)
@@ -382,7 +390,7 @@ func (t *TerraformApp) Run(args LocalAppRunningArgs) error {
 
 	if tplParams.AutoApprove || tplParams.AllowAutoApprove && params.AutoApprove {
 		t.Logger.SetStatus(task_logger.TaskRunningStatus)
-		return t.Apply(applyArgs, args.EnvironmentVars, args.Inputs, args.Callback)
+		return t.Apply(applyArgs, args.EnvironmentVars, args.Inputs, args.StopCh)
 	}
 
 	t.Logger.SetStatus(task_logger.TaskWaitingConfirmation)
@@ -402,7 +410,7 @@ func (t *TerraformApp) Run(args LocalAppRunningArgs) error {
 		t.Logger.SetStatus(task_logger.TaskFailStatus)
 	case task_logger.TaskConfirmed:
 		t.Logger.SetStatus(task_logger.TaskRunningStatus)
-		return t.Apply(applyArgs, args.EnvironmentVars, args.Inputs, args.Callback)
+		return t.Apply(applyArgs, args.EnvironmentVars, args.Inputs, args.StopCh)
 	}
 
 	return nil

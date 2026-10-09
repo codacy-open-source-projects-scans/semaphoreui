@@ -1,17 +1,34 @@
 package api
 
 import (
-	"bufio"
-	"bytes"
 	"net/http"
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/pkg/tz"
+	"github.com/semaphoreui/semaphore/services/audit"
+	"github.com/semaphoreui/semaphore/services/server"
 	"github.com/semaphoreui/semaphore/util"
 	log "github.com/sirupsen/logrus"
 )
 
-func getAllRunners(w http.ResponseWriter, r *http.Request) {
+type runnerWithToken struct {
+	db.Runner
+	Token string `json:"token"`
+}
+
+// GlobalRunnerController handles CRUD for global (non-project) runners.
+type GlobalRunnerController struct {
+	runnerService server.RunnerService
+}
+
+func NewGlobalRunnerController(runnerService server.RunnerService) *GlobalRunnerController {
+	return &GlobalRunnerController{
+		runnerService: runnerService,
+	}
+}
+
+func (c *GlobalRunnerController) GetRunners(w http.ResponseWriter, r *http.Request) {
 	runners, err := helpers.Store(r).GetAllRunners(false, false, db.RunnerFilterIgnoreTags, nil)
 
 	if err != nil {
@@ -22,16 +39,18 @@ func getAllRunners(w http.ResponseWriter, r *http.Request) {
 
 	result = append(result, runners...)
 
+	now := tz.Now()
+	offlineTimeout := util.Config.RunnersOfflineTimeout()
+
+	for i := range result {
+		result[i].Registered = result[i].IsRegistered()
+		result[i].FillStatus(now, offlineTimeout)
+	}
+
 	helpers.WriteJSON(w, http.StatusOK, result)
 }
 
-type runnerWithToken struct {
-	db.Runner
-	Token      string `json:"token"`
-	PrivateKey string `json:"private_key"`
-}
-
-func addGlobalRunner(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) AddRunner(w http.ResponseWriter, r *http.Request) {
 	var runner db.Runner
 	if !helpers.Bind(w, r, &runner) {
 		return
@@ -39,30 +58,7 @@ func addGlobalRunner(w http.ResponseWriter, r *http.Request) {
 
 	runner.ProjectID = nil
 
-	var privateKey []byte
-
-	if runner.PublicKey == nil {
-		var b bytes.Buffer
-		privateKeyFile := bufio.NewWriter(&b)
-
-		publicKey, err := util.GeneratePrivateKey(privateKeyFile)
-		if err != nil {
-			helpers.WriteError(w, err)
-			return
-		}
-
-		err = privateKeyFile.Flush()
-		if err != nil {
-			helpers.WriteError(w, err)
-			return
-		}
-
-		privateKey = b.Bytes()
-
-		runner.PublicKey = &publicKey
-	}
-
-	newRunner, err := helpers.Store(r).CreateRunner(runner)
+	newRunner, err := c.runnerService.CreateRunner(runner)
 
 	if err != nil {
 		log.Warn("Runner is not created: " + err.Error())
@@ -70,21 +66,22 @@ func addGlobalRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.RunnerLifecycleCreate,
+		Target: audit.ResourceTarget(audit.TargetRunner, newRunner.ID, newRunner.Name),
+	})
+
 	helpers.WriteJSON(w, http.StatusCreated, runnerWithToken{
-		Runner:     newRunner,
-		Token:      newRunner.Token,
-		PrivateKey: string(privateKey),
+		Runner: newRunner,
+		Token:  newRunner.Token,
 	})
 }
 
-func globalRunnerMiddleware(next http.Handler) http.Handler {
+func (c *GlobalRunnerController) RunnerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		runnerID, err := helpers.GetIntParam("runner_id", w, r)
+		runnerID, ok := helpers.GetIntParamOrAbort("runner_id", w, r)
 
-		if err != nil {
-			helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "runner_id required",
-			})
+		if !ok {
 			return
 		}
 
@@ -104,13 +101,16 @@ func globalRunnerMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func getGlobalRunner(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) GetRunner(w http.ResponseWriter, r *http.Request) {
 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
+
+	runner.Registered = runner.IsRegistered()
+	runner.FillStatus(tz.Now(), util.Config.RunnersOfflineTimeout())
 
 	helpers.WriteJSON(w, http.StatusOK, runner)
 }
 
-func updateGlobalRunner(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) UpdateRunner(w http.ResponseWriter, r *http.Request) {
 	oldRunner := helpers.GetFromContext(r, "runner").(*db.Runner)
 
 	var runner db.Runner
@@ -130,10 +130,15 @@ func updateGlobalRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.RunnerLifecycleUpdate,
+		Target: audit.ResourceTarget(audit.TargetRunner, oldRunner.ID, runner.Name),
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func clearGlobalRunnerCache(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) ClearRunnerCache(w http.ResponseWriter, r *http.Request) {
 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
 
 	store := helpers.Store(r)
@@ -145,10 +150,15 @@ func clearGlobalRunnerCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.RunnerCacheClear,
+		Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func deleteGlobalRunner(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) DeleteRunner(w http.ResponseWriter, r *http.Request) {
 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
 
 	store := helpers.Store(r)
@@ -160,10 +170,47 @@ func deleteGlobalRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.RunnerLifecycleDelete,
+		Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func setGlobalRunnerActive(w http.ResponseWriter, r *http.Request) {
+func (c *GlobalRunnerController) RegenerateRegistrationToken(w http.ResponseWriter, r *http.Request) {
+	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
+
+	token, err := c.runnerService.RegenerateRegistrationToken(*runner)
+
+	if err != nil {
+		helpers.WriteErrorStatus(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.RunnerCredentialRotate,
+		Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+	})
+
+	helpers.WriteJSON(w, http.StatusOK, map[string]any{
+		"registration_token": token,
+		"runner_id":          runner.ID,
+	})
+}
+
+func (c *GlobalRunnerController) GetRunnerTags(w http.ResponseWriter, r *http.Request) {
+	tags, err := helpers.Store(r).GetGlobalRunnerTags()
+
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	helpers.WriteJSON(w, http.StatusOK, tags)
+}
+
+func (c *GlobalRunnerController) SetRunnerActive(w http.ResponseWriter, r *http.Request) {
 	runner := helpers.GetFromContext(r, "runner").(*db.Runner)
 
 	store := helpers.Store(r)
@@ -177,6 +224,7 @@ func setGlobalRunnerActive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	changed := runner.Active != body.Active
 	runner.Active = body.Active
 
 	err := store.UpdateRunner(*runner)
@@ -184,6 +232,17 @@ func setGlobalRunnerActive(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		helpers.WriteErrorStatus(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	if changed {
+		kind := audit.RunnerLifecycleDisable
+		if body.Active {
+			kind = audit.RunnerLifecycleEnable
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:   kind,
+			Target: audit.ResourceTarget(audit.TargetRunner, runner.ID, runner.Name),
+		})
 	}
 
 	w.WriteHeader(http.StatusNoContent)

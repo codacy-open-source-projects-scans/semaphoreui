@@ -84,6 +84,7 @@ func (d *SqlDbConnection) Connect() {
 	}
 
 	d.sql.AddTableWithName(db.APIToken{}, "user__token").SetKeys(false, "id")
+	d.sql.AddTableWithName(db.AuditEvent{}, "audit_event").SetKeys(false, "seq")
 	d.sql.AddTableWithName(db.AccessKey{}, "access_key").SetKeys(true, "id")
 	d.sql.AddTableWithName(db.Environment{}, "project__environment").SetKeys(true, "id")
 	d.sql.AddTableWithName(db.Inventory{}, "project__inventory").SetKeys(true, "id")
@@ -95,9 +96,20 @@ func (d *SqlDbConnection) Connect() {
 	d.sql.AddTableWithName(db.User{}, "user").SetKeys(true, "id")
 	d.sql.AddTableWithName(db.Session{}, "session").SetKeys(true, "id")
 	d.sql.AddTableWithName(db.TaskParams{}, "project__task_params").SetKeys(true, "id")
+	d.sql.AddTableWithName(db.UserExternalIdentity{}, "user__external_identity").SetKeys(true, "id")
 
 	if d.GetDialect() == util.DbDriverSQLite {
 		_, err = d.Exec("PRAGMA foreign_keys = ON")
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = d.Exec("PRAGMA busy_timeout = 5000")
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = d.Exec("PRAGMA journal_mode = WAL")
 		if err != nil {
 			panic(err)
 		}
@@ -105,13 +117,23 @@ func (d *SqlDbConnection) Connect() {
 }
 
 func (d *SqlDbConnection) Close() {
+	if d.sql.Db == nil {
+		return
+	}
 	err := d.sql.Db.Close()
 	if err != nil {
 		panic(err)
 	}
 }
 
-func CreateTestStore() *SqlDb {
+func InitConfigCreateTestStore() *SqlDb {
+	return InitConfigCreateTestStoreAt(nil)
+}
+
+// InitConfigCreateTestStoreAt creates a test store migrated up to
+// targetVersion (or fully when nil), so tests can seed data on an older
+// schema and then apply the remaining migrations with db.Migrate.
+func InitConfigCreateTestStoreAt(targetVersion *string) *SqlDb {
 	util.Config = &util.ConfigType{
 		SQLite: &util.DbConfig{
 			Hostname: ":memory:",
@@ -121,12 +143,21 @@ func CreateTestStore() *SqlDb {
 			Events: &util.EventLogType{},
 			Tasks:  &util.TaskLogType{},
 		},
+		Process: &util.ConfigProcess{},
+		Runners: &util.RunnersConfig{},
+		Apps: map[string]util.App{
+			"ansible": {},
+			"bash":    {},
+		},
 	}
 	store := CreateDb(util.DbDriverSQLite)
 
-	store.Connect("")
+	store.Connect()
 
-	db.Migrate(store, nil)
+	err := db.Migrate(store, targetVersion)
+	if err != nil {
+		panic(err)
+	}
 
 	return store
 }
@@ -209,6 +240,48 @@ func (d *SqlDbConnection) Insert(primaryKeyColumnName string, query string, args
 	return int(insertId), nil
 }
 
+// Begin opens a transaction on the underlying connection for callers outside
+// this package (the Pro stores) that must write several rows atomically.
+func (d *SqlDbConnection) Begin() (*gorp.Transaction, error) {
+	return d.sql.Begin()
+}
+
+// InsertTx is Insert inside a transaction: it returns the generated primary
+// key on every dialect (Postgres through "returning", the rest through
+// LastInsertId).
+func (d *SqlDbConnection) InsertTx(tx *gorp.Transaction, primaryKeyColumnName string, query string, args ...any) (int, error) {
+	var insertId int64
+
+	formattedArgs := formatArgs(args)
+
+	switch d.sql.Dialect.(type) {
+	case gorp.PostgresDialect:
+		var err error
+		if primaryKeyColumnName != "" {
+			query += " returning " + primaryKeyColumnName
+			err = tx.QueryRow(d.PrepareQuery(query), formattedArgs...).Scan(&insertId)
+		} else {
+			_, err = tx.Exec(d.PrepareQuery(query), formattedArgs...)
+		}
+
+		if err != nil {
+			return 0, err
+		}
+	default:
+		res, err := tx.Exec(d.PrepareQuery(query), formattedArgs...)
+		if err != nil {
+			return 0, err
+		}
+
+		insertId, err = res.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return int(insertId), nil
+}
+
 func (d *SqlDbConnection) Exec(query string, args ...any) (sql.Result, error) {
 	q := d.PrepareQuery(query)
 	return d.sql.Exec(q, args...)
@@ -242,12 +315,12 @@ func (d *SqlDbConnection) DeleteObject(projectID int, props db.ObjectProps, obje
 	}
 
 	if props.IsGlobal {
-		return validateMutationResult(
+		return requireDeletedRow(
 			d.Exec(
 				"delete from "+props.TableName+" where `"+primaryColumnName+"`=?",
 				objectID))
 	} else {
-		return validateMutationResult(
+		return requireDeletedRow(
 			d.Exec(
 				"delete from "+props.TableName+" where project_id=? and `"+primaryColumnName+"`=?",
 				projectID,
@@ -344,7 +417,7 @@ func (d *SqlDb) GetDialect() string {
 	return d.connection.GetDialect()
 }
 
-func (d *SqlDb) Close(token string) {
+func (d *SqlDb) Close() {
 	d.connection.Close()
 }
 
@@ -396,12 +469,27 @@ var identifierQuoteRE = regexp.MustCompile("`")
 // validateMutationResult checks the success of the update query
 func validateMutationResult(res sql.Result, err error) error {
 	if err != nil {
-		if strings.Contains(err.Error(), "foreign key") {
+		if strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 			err = db.ErrInvalidOperation
 		}
 		return err
 	}
 
+	return nil
+}
+
+// requireDeletedRow returns db.ErrNotFound when the statement removed no row, so the audit records only real deletes.
+func requireDeletedRow(res sql.Result, err error) error {
+	if err = validateMutationResult(res, err); err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return db.ErrNotFound
+	}
 	return nil
 }
 
@@ -557,11 +645,7 @@ func (d *SqlDb) deleteObject(projectID int, props db.ObjectProps, objectID any) 
 	return d.connection.DeleteObject(projectID, props, objectID)
 }
 
-func (d *SqlDb) PermanentConnection() bool {
-	return true
-}
-
-func (d *SqlDb) Connect(_ string) {
+func (d *SqlDb) Connect() {
 	d.connection.Connect()
 }
 
@@ -592,6 +676,13 @@ func (d *SqlDb) getObjectRefs(projectID int, objectProps db.ObjectProps, objectI
 	}
 
 	refs.AccessKeys, err = d.getObjectRefsFrom(projectID, objectProps, objectID, db.AccessKeyProps)
+	if err != nil {
+		return
+	}
+
+	// A host config refers to a key through ssh_key_id. Without this, deleting
+	// the key reports no reference and the mapping disappears with it.
+	refs.HostConfigs, err = d.getObjectRefsFrom(projectID, objectProps, objectID, db.HostConfigProps)
 	if err != nil {
 		return
 	}

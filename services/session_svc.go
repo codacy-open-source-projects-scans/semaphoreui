@@ -1,11 +1,12 @@
 package services
 
 import (
+	"net/http"
+
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/pkg/tz"
 	"github.com/semaphoreui/semaphore/util"
 	log "github.com/sirupsen/logrus"
-	"net/http"
-	"time"
 )
 
 type SessionService interface {
@@ -49,9 +50,9 @@ func (s *sessionServiceImpl) GetSession(cookie http.Cookie) (*db.Session, bool) 
 		return nil, false
 	}
 
-	if time.Since(session.LastActive).Hours() > 7*24 {
-		// more than week old unused session
-		// destroy.
+	if session.IsExpiredAt(tz.Now(), util.Config.MaxSessionLife(), db.SessionInactivityTimeout) {
+		// The session was unused for too long or outlived the configured
+		// absolute lifetime. Destroy it so it cannot be reused.
 		if err = s.sessionRepo.ExpireSession(userID, sessionID); err != nil {
 			// it is internal error, it doesn't concern the user
 			log.Error(err)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/services/schedules"
 )
 
@@ -14,8 +15,8 @@ import (
 func SchedulesMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		project := helpers.GetFromContext(r, "project").(db.Project)
-		scheduleID, err := helpers.GetIntParam("schedule_id", w, r)
-		if err != nil { // not specified schedule_id
+		scheduleID, ok := helpers.GetIntParamOrAbort("schedule_id", w, r)
+		if !ok { // not specified schedule_id
 			return
 		}
 
@@ -55,11 +56,8 @@ func GetProjectSchedules(w http.ResponseWriter, r *http.Request) {
 }
 func GetTemplateSchedules(w http.ResponseWriter, r *http.Request) {
 	project := helpers.GetFromContext(r, "project").(db.Project)
-	templateID, err := helpers.GetIntParam("template_id", w, r)
-	if err != nil {
-		helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "template_id must be provided",
-		})
+	templateID, ok := helpers.GetIntParamOrAbort("template_id", w, r)
+	if !ok {
 		return
 	}
 
@@ -154,6 +152,13 @@ func AddSchedule(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Schedule ID %d created", schedule.ID),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceScheduleCreate,
+		Target:    audit.ResourceTarget(audit.TargetSchedule, schedule.ID, schedule.Name),
+		ProjectID: project.ID,
+		Metadata:  audit.ScheduleMetadata{TemplateID: schedule.TemplateID},
+	})
+
 	refreshSchedulePool(r)
 
 	helpers.WriteJSON(w, http.StatusCreated, schedule)
@@ -202,6 +207,27 @@ func UpdateSchedule(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Schedule ID %d updated", schedule.ID),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceScheduleUpdate,
+		Target:    audit.ResourceTarget(audit.TargetSchedule, oldSchedule.ID, schedule.Name),
+		ProjectID: oldSchedule.ProjectID,
+		Metadata:  audit.ScheduleMetadata{TemplateID: schedule.TemplateID},
+	})
+
+	// A full update can switch the schedule on or off too.
+	if oldSchedule.Active != schedule.Active {
+		kind := audit.ResourceScheduleDeactivate
+		if schedule.Active {
+			kind = audit.ResourceScheduleActivate
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:      kind,
+			Target:    audit.ResourceTarget(audit.TargetSchedule, oldSchedule.ID, schedule.Name),
+			ProjectID: oldSchedule.ProjectID,
+			Metadata:  audit.ScheduleMetadata{TemplateID: schedule.TemplateID},
+		})
+	}
+
 	refreshSchedulePool(r)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -232,6 +258,19 @@ func SetScheduleActive(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Schedule ID %d updated", oldSchedule.ID),
 	})
 
+	if oldSchedule.Active != schedule.Active {
+		kind := audit.ResourceScheduleDeactivate
+		if schedule.Active {
+			kind = audit.ResourceScheduleActivate
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:      kind,
+			Target:    audit.ResourceTarget(audit.TargetSchedule, oldSchedule.ID, oldSchedule.Name),
+			ProjectID: oldSchedule.ProjectID,
+			Metadata:  audit.ScheduleMetadata{TemplateID: oldSchedule.TemplateID},
+		})
+	}
+
 	refreshSchedulePool(r)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -253,6 +292,12 @@ func RemoveSchedule(w http.ResponseWriter, r *http.Request) {
 		ObjectType:  db.EventSchedule,
 		ObjectID:    schedule.ID,
 		Description: fmt.Sprintf("Schedule ID %d deleted", schedule.ID),
+	})
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceScheduleDelete,
+		Target:    audit.ResourceTarget(audit.TargetSchedule, schedule.ID, schedule.Name),
+		ProjectID: schedule.ProjectID,
 	})
 
 	refreshSchedulePool(r)

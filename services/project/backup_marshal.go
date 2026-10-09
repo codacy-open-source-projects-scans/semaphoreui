@@ -2,13 +2,14 @@ package project
 
 import (
 	"fmt"
-	"github.com/semaphoreui/semaphore/db"
 	"reflect"
+
+	"github.com/semaphoreui/semaphore/db"
 )
 
 func marshalValue(v reflect.Value) (any, error) {
 	// Handle pointers
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return nil, nil
 		}
@@ -181,7 +182,7 @@ func toFloat64(data any) (float64, bool) {
 
 func unmarshalValueWithBackupTags(data any, v reflect.Value) error {
 	// Handle pointers
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		// Initialize pointer if it's nil
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))

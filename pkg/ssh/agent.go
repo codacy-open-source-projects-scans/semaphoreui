@@ -1,13 +1,16 @@
 package ssh
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"net"
+	"os"
+	"path"
+
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pkg/random"
 	"github.com/semaphoreui/semaphore/util"
-	"io"
-	"net"
-	"path"
 
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
 	"golang.org/x/crypto/ssh"
@@ -57,6 +60,10 @@ func (a *Agent) Listen() error {
 		}
 	}
 
+	if err := os.MkdirAll(path.Dir(a.SocketFile), 0o755); err != nil {
+		return fmt.Errorf("creating socket directory: %w", err)
+	}
+
 	l, err := net.ListenUnix(
 		"unix",
 		&net.UnixAddr{
@@ -66,6 +73,22 @@ func (a *Agent) Listen() error {
 	)
 	if err != nil {
 		return fmt.Errorf("listening on socket %q: %w", a.SocketFile, err)
+	}
+
+	// Anyone able to connect to the socket can authenticate with the key it
+	// holds. The directory is shared with the repository checkout and stays
+	// traversable, so the restriction goes on the socket itself. git may run as
+	// the configured process user, which then has to own it.
+	if err := os.Chmod(a.SocketFile, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("securing socket %q: %w", a.SocketFile, err)
+	}
+
+	if util.Config != nil && util.Config.Process != nil {
+		if err := util.ChownDir(a.SocketFile); err != nil {
+			_ = l.Close()
+			return fmt.Errorf("securing socket %q: %w", a.SocketFile, err)
+		}
 	}
 
 	l.SetUnlinkOnClose(true)
@@ -88,7 +111,10 @@ func (a *Agent) Listen() error {
 			go func(conn net.Conn) {
 				defer conn.Close() //nolint:errcheck
 
-				if err := agent.ServeAgent(keyring, conn); err != nil && err != io.EOF {
+				// ServeAgent only returns once the connection breaks; io.EOF just
+				// means the client went away. staticcheck knows ServeAgent never
+				// returns nil, so the defensive nil check needs the nolint.
+				if err := agent.ServeAgent(keyring, conn); err != nil && !errors.Is(err, io.EOF) { //nolint:staticcheck // SA4023
 					a.Logger.Logf("error serving SSH agent listener: %w", err)
 				}
 			}(conn)
@@ -142,19 +168,72 @@ type AccessKeyInstallation struct {
 }
 
 func (key *AccessKeyInstallation) GetGitEnv() (env []string) {
+	return key.GetGitEnvWithHostConfigs(nil)
+}
+
+// GetGitEnvWithHostConfigs returns the environment for git commands, applying
+// the credential mappings of the project when it has any.
+//
+// The generated config replaces the administrator's as the file given to -F,
+// and includes it, so a mapped host uses its own credential while everything
+// else keeps the configuration it has today.
+func (key *AccessKeyInstallation) GetGitEnvWithHostConfigs(
+	hostConfigs *HostConfigInstallation,
+) (env []string) {
+
 	env = make([]string, 0)
 
 	env = append(env, "GIT_TERMINAL_PROMPT=0")
-	if key.SSHAgent != nil {
-		env = append(env, fmt.Sprintf("SSH_AUTH_SOCK=%s", key.SSHAgent.SocketFile))
-		sshCmd := "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-		if util.Config.SshConfigPath != "" {
-			sshCmd += " -F " + util.Config.SshConfigPath
+
+	generated := hostConfigs.SSHConfigPath()
+
+	// The command is needed without a key of its own too: a repository which
+	// needs no key still has to reach a mapped host with the mapped credential.
+	if key.SSHAgent != nil || generated != "" {
+		if key.SSHAgent != nil {
+			env = append(env, fmt.Sprintf("SSH_AUTH_SOCK=%s", key.SSHAgent.SocketFile))
+		}
+
+		// The generated config includes the administrator's, so it replaces it
+		// rather than being added to it.
+		sshConfigPath := generated
+		if sshConfigPath == "" {
+			sshConfigPath = util.Config.GetSshConfigPath()
+		}
+
+		sshCmd := "ssh " + gitHostKeyCheckingOpts()
+		if sshConfigPath != "" {
+			sshCmd += " -F " + sshConfigPath
 		}
 		env = append(env, fmt.Sprintf("GIT_SSH_COMMAND=%s", sshCmd))
 	}
 
+	if params := hostConfigs.GitConfigParameters(); params != "" {
+		env = append(env, "GIT_CONFIG_PARAMETERS="+params)
+	}
+
 	return env
+}
+
+// gitHostKeyCheckingOpts returns the ssh host-key verification options used for
+// git operations. Host-key checking is enabled so a network attacker cannot
+// impersonate the git server. When an explicit known_hosts file is configured
+// it is used with strict checking; otherwise a persistent trust-on-first-use
+// file under TmpPath is used (accept-new): the first host key seen is pinned and
+// any subsequent change is rejected.
+func gitHostKeyCheckingOpts() string {
+	switch util.Config.Ssh.StrictHostKeyChecking {
+	case util.SshStrictHostKeyCheckingYes:
+		return fmt.Sprintf("-o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s", util.Config.Ssh.KnownHostsFile)
+	case util.SshStrictHostKeyCheckingNo:
+		// No leading "ssh": the caller prepends it, and a second one is taken by
+		// ssh as the host to connect to ("Could not resolve hostname ssh").
+		return "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+	case util.SshStrictHostKeyCheckingAcceptNew:
+		return fmt.Sprintf("-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s", util.Config.Ssh.KnownHostsFile)
+	default:
+		panic("Unknown SSH strict host key check option")
+	}
 }
 
 func (key *AccessKeyInstallation) Destroy() error {

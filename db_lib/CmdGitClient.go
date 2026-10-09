@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/semaphoreui/semaphore/pkg/ssh"
@@ -24,9 +25,23 @@ func (c CmdGitClient) makeCmd(
 	installation ssh.AccessKeyInstallation,
 	args ...string,
 ) *exec.Cmd {
-	cmd := exec.Command("git") //nolint: gas
+	cmd := exec.Command("git") //nolint:gosec
 
-	cmd.Env = append(getEnvironmentVars(), installation.GetGitEnv()...)
+	cmd.Env = append(getEnvironmentVars(), installation.GetGitEnvWithHostConfigs(r.HostConfigs)...)
+
+	// Unlike the app runners, git gets HOME only when nothing has set it already,
+	// and never gets an empty one: getHomeDir returns "" for an out-of-range
+	// home_dir_mode, and `HOME=` would hide the user's ~/.gitconfig and credential
+	// helper, which is the difference between a working and a failing clone. An
+	// explicit env_vars: {"HOME": ""} is treated the same way, for the same reason.
+	if !hasNonEmptyEnvVar(cmd.Env, "HOME") {
+		if homeDir := getHomeDir(r.Repository, r.TemplateID); homeDir != "" {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("HOME=%s", homeDir))
+		} else if h := os.Getenv("HOME"); h != "" {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("HOME=%s", h))
+		}
+	}
+	appendPlatformEnv(&cmd.Env)
 
 	switch targetDir {
 	case GitRepositoryTmpPath:
@@ -71,7 +86,8 @@ func (c CmdGitClient) run(r GitRepository, targetDir GitRepositoryDirType, args 
 
 	cmd := c.makeCmd(r, targetDir, keyInstallation, args...)
 
-	r.Logger.LogCmd(cmd)
+	finishLog := r.Logger.LogCmd(cmd)
+	defer finishLog()
 
 	return cmd.Run()
 }
@@ -92,12 +108,19 @@ func (c CmdGitClient) output(r GitRepository, targetDir GitRepositoryDirType, ar
 	return
 }
 
+func gitSubmoduleJobs() int {
+	if util.Config != nil && util.Config.GitSubmoduleJobs >= 1 {
+		return util.Config.GitSubmoduleJobs
+	}
+	return 1
+}
+
 func (c CmdGitClient) Clone(r GitRepository) error {
-	r.Logger.Log("Cloning Repository " + r.Repository.GitURL)
+	r.Logger.Log("Cloning Repository " + r.Repository.GetRedactedGitURL())
 
 	var dirName string
 	if r.TmpDirName == "" {
-		dirName = r.Repository.GetDirName(r.TemplateID)
+		dirName = r.Repository.GetCheckoutDirName(r.TemplateID)
 	} else {
 		dirName = r.TmpDirName
 	}
@@ -113,26 +136,35 @@ func (c CmdGitClient) Clone(r GitRepository) error {
 	return c.run(r, GitRepositoryTmpPath,
 		"clone",
 		"--recursive",
+		"--jobs",
+		strconv.Itoa(gitSubmoduleJobs()),
 		"--branch",
 		r.Repository.GitBranch,
-		r.Repository.GetGitURL(false),
+		"--end-of-options",
+		r.Repository.GetGitURL(true),
 		dirName)
 }
 
 func (c CmdGitClient) Pull(r GitRepository) error {
-	r.Logger.Log("Updating Repository " + r.Repository.GitURL)
+	r.Logger.Log("Updating Repository " + r.Repository.GetRedactedGitURL())
 
-	err := c.run(r, GitRepositoryFullPath, "pull", "origin", r.Repository.GitBranch)
+	err := c.run(r, GitRepositoryFullPath, "pull", "origin", "--end-of-options", r.Repository.GitBranch)
 	if err != nil {
 		return err
 	}
-	return c.run(r, GitRepositoryFullPath, "submodule", "update", "--init", "--recursive")
+	return c.run(r, GitRepositoryFullPath,
+		"submodule",
+		"update",
+		"--init",
+		"--recursive",
+		"--jobs",
+		strconv.Itoa(gitSubmoduleJobs()))
 }
 
 func (c CmdGitClient) Checkout(r GitRepository, target string) error {
 	r.Logger.Log("Checkout repository to " + target)
 
-	return c.run(r, GitRepositoryFullPath, "checkout", target)
+	return c.run(r, GitRepositoryFullPath, "checkout", "--end-of-options", target)
 }
 
 func (c CmdGitClient) CanBePulled(r GitRepository) bool {
@@ -155,9 +187,7 @@ func (c CmdGitClient) GetLastCommitMessage(r GitRepository) (msg string, err err
 		return
 	}
 
-	if len(msg) > 100 {
-		msg = msg[0:100]
-	}
+	msg = truncateCommitMessage(msg)
 
 	return
 }
@@ -169,7 +199,7 @@ func (c CmdGitClient) GetLastCommitHash(r GitRepository) (hash string, err error
 }
 
 func (c CmdGitClient) GetLastRemoteCommitHash(r GitRepository) (hash string, err error) {
-	out, err := c.output(r, GitRepositoryTmpPath, "ls-remote", r.Repository.GetGitURL(false), r.Repository.GitBranch)
+	out, err := c.output(r, GitRepositoryTmpPath, "ls-remote", "--end-of-options", r.Repository.GetGitURL(true), r.Repository.GitBranch)
 	if err != nil {
 		return
 	}
@@ -187,7 +217,7 @@ func (c CmdGitClient) GetLastRemoteCommitHash(r GitRepository) (hash string, err
 }
 
 func (c CmdGitClient) GetRemoteBranches(r GitRepository) ([]string, error) {
-	out, err := c.output(r, GitRepositoryTmpPath, "ls-remote", "--heads", r.Repository.GetGitURL(false))
+	out, err := c.output(r, GitRepositoryTmpPath, "ls-remote", "--heads", "--end-of-options", r.Repository.GetGitURL(true))
 	if err != nil {
 		return nil, err
 	}

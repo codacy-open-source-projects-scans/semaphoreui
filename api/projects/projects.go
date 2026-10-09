@@ -7,6 +7,7 @@ import (
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -43,7 +44,7 @@ func GetProjects(w http.ResponseWriter, r *http.Request) {
 	helpers.WriteJSON(w, http.StatusOK, projects)
 }
 
-func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emptyEnvID int, store db.Store) (err error) {
+func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, store db.Store) (err error) {
 	var demoRepo db.Repository
 
 	var buildInv db.Inventory
@@ -149,15 +150,15 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 
 	desc = "Pings the website to provide a real-world example of using Semaphore."
 	_, err = store.CreateTemplate(db.Template{
-		Name:          "Ping semaphoreui.com",
-		Playbook:      "ping.yml",
-		Description:   &desc,
-		ProjectID:     projectID,
-		InventoryID:   &prodInv.ID,
-		EnvironmentID: &emptyEnvID,
-		RepositoryID:  demoRepo.ID,
-		App:           db.AppAnsible,
-		ViewID:        &toolsView.ID,
+		Name:           "Ping semaphoreui.com",
+		Playbook:       "ping.yml",
+		Description:    &desc,
+		ProjectID:      projectID,
+		InventoryID:    &prodInv.ID,
+		EnvironmentIDs: []int{},
+		RepositoryID:   demoRepo.ID,
+		App:            db.AppAnsible,
+		ViewID:         &toolsView.ID,
 	})
 
 	if err != nil {
@@ -168,16 +169,16 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 
 	var startVersion = "1.0.0"
 	buildTpl, err := store.CreateTemplate(db.Template{
-		Name:          "Build demo app",
-		Playbook:      "build.yml",
-		Type:          db.TemplateBuild,
-		ProjectID:     projectID,
-		InventoryID:   &buildInv.ID,
-		EnvironmentID: &emptyEnvID,
-		RepositoryID:  demoRepo.ID,
-		StartVersion:  &startVersion,
-		App:           db.AppAnsible,
-		ViewID:        &buildView.ID,
+		Name:           "Build demo app",
+		Playbook:       "build.yml",
+		Type:           db.TemplateBuild,
+		ProjectID:      projectID,
+		InventoryID:    &buildInv.ID,
+		EnvironmentIDs: []int{},
+		RepositoryID:   demoRepo.ID,
+		StartVersion:   &startVersion,
+		App:            db.AppAnsible,
+		ViewID:         &buildView.ID,
 	})
 
 	if err != nil {
@@ -191,7 +192,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Playbook:        "deploy.yml",
 		ProjectID:       projectID,
 		InventoryID:     &devInv.ID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		Autorun:         true,
@@ -221,7 +222,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Playbook:        "deploy.yml",
 		ProjectID:       projectID,
 		InventoryID:     &prodInv.ID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		App:             db.AppAnsible,
@@ -249,7 +250,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Type:            db.TemplateTask,
 		Playbook:        "",
 		ProjectID:       projectID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		App:             db.AppTofu,
@@ -265,7 +266,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Type:            db.TemplateTask,
 		Playbook:        "",
 		ProjectID:       projectID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		App:             db.AppTerragrunt,
@@ -282,7 +283,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Playbook:        "print_system_info.sh",
 		ProjectID:       projectID,
 		InventoryID:     &prodInv.ID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		App:             db.AppBash,
@@ -299,7 +300,7 @@ func (c *ProjectsController) createDemoProject(projectID int, noneKeyID int, emp
 		Playbook:        "print_system_info.ps1",
 		ProjectID:       projectID,
 		InventoryID:     &prodInv.ID,
-		EnvironmentID:   &emptyEnvID,
+		EnvironmentIDs:  []int{},
 		RepositoryID:    demoRepo.ID,
 		BuildTemplateID: &buildTpl.ID,
 		App:             db.AppPowerShell,
@@ -315,6 +316,7 @@ func (c *ProjectsController) AddProject(w http.ResponseWriter, r *http.Request) 
 
 	if !user.Admin && !util.Config.NonAdminCanCreateProject {
 		log.Warn(user.Username + " is not permitted to edit users")
+		helpers.RecordDenied(r, "admin", 0)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -338,8 +340,20 @@ func (c *ProjectsController) AddProject(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// The project row exists, so a failed setup step is still recorded.
+	recordSetupFailed := func() {
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:      audit.ResourceProjectCreate,
+			Target:    audit.ResourceTarget(audit.TargetProject, body.ID, body.Name),
+			ProjectID: body.ID,
+			Reason:    audit.ReasonSetupFailed,
+			Metadata:  audit.ProjectCreateMetadata{Demo: bodyWithDemo.Demo, Partial: true},
+		})
+	}
+
 	_, err = store.CreateProjectUser(db.ProjectUser{ProjectID: body.ID, UserID: user.ID, Role: db.ProjectOwner})
 	if err != nil {
+		recordSetupFailed()
 		helpers.WriteError(w, err)
 		return
 	}
@@ -351,6 +365,7 @@ func (c *ProjectsController) AddProject(w http.ResponseWriter, r *http.Request) 
 	})
 
 	if err != nil {
+		recordSetupFailed()
 		helpers.WriteError(w, err)
 		return
 	}
@@ -363,38 +378,20 @@ func (c *ProjectsController) AddProject(w http.ResponseWriter, r *http.Request) 
 	})
 
 	if err != nil {
+		recordSetupFailed()
 		helpers.WriteError(w, err)
 		return
 	}
-
-	//_, err = store.CreateInventory(db.Inventory{
-	//	Name:      "None",
-	//	ProjectID: body.ID,
-	//	Type:      "none",
-	//	SSHKeyID:  &noneKey.ID,
-	//})
-
-	//if err != nil {
-	//	helpers.WriteError(w, err)
-	//	return
-	//}
-
-	envStr := "{}"
-	emptyEnv, err := store.CreateEnvironment(db.Environment{
-		Name:      "Empty",
-		ProjectID: body.ID,
-		JSON:      "{}",
-		ENV:       &envStr,
-	})
 
 	if err != nil {
 		return
 	}
 
 	if bodyWithDemo.Demo {
-		err = c.createDemoProject(body.ID, noneKey.ID, emptyEnv.ID, store)
+		err = c.createDemoProject(body.ID, noneKey.ID, store)
 
 		if err != nil {
+			recordSetupFailed()
 			helpers.WriteError(w, err)
 			return
 		}
@@ -406,6 +403,14 @@ func (c *ProjectsController) AddProject(w http.ResponseWriter, r *http.Request) 
 		ObjectType:  db.EventProject,
 		ObjectID:    body.ID,
 		Description: "Project created",
+	})
+
+	// Demo objects are sample content, so the project event covers them.
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceProjectCreate,
+		Target:    audit.ResourceTarget(audit.TargetProject, body.ID, body.Name),
+		ProjectID: body.ID,
+		Metadata:  audit.ProjectCreateMetadata{Demo: bodyWithDemo.Demo},
 	})
 
 	helpers.WriteJSON(w, http.StatusCreated, body)

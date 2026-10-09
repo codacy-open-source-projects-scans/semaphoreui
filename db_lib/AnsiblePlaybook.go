@@ -1,11 +1,13 @@
 package db_lib
 
 import (
+	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/semaphoreui/semaphore/db"
@@ -14,14 +16,20 @@ import (
 )
 
 type AnsiblePlaybook struct {
-	TemplateID int
-	Repository db.Repository
-	Logger     task_logger.Logger
+	TemplateID       int
+	WorkingDirectory *string
+	Repository       db.Repository
+	Logger           task_logger.Logger
 }
 
-func (p AnsiblePlaybook) makeCmd(command string, args []string, environmentVars []string) *exec.Cmd {
-	cmd := exec.Command(command, args...) //nolint: gas
-	cmd.Dir = p.GetFullPath()
+func (p AnsiblePlaybook) makeCmd(command string, args []string, environmentVars []string) (*exec.Cmd, error) {
+	cmdDir, err := p.resolveWorkingDirectory()
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.Command(command, args...) //nolint:gosec
+	cmd.Dir = cmdDir
 
 	cmd.Env = append(cmd.Env, "PYTHONUNBUFFERED=1")
 	cmd.Env = append(cmd.Env, "ANSIBLE_FORCE_COLOR=True")
@@ -39,21 +47,55 @@ func (p AnsiblePlaybook) makeCmd(command string, args []string, environmentVars 
 
 	cmd.SysProcAttr = util.Config.GetAppSysProcAttr()
 
-	return cmd
+	return cmd, nil
+}
+
+func (p AnsiblePlaybook) resolveWorkingDirectory() (string, error) {
+	repoRoot := p.Repository.GetFullPath(p.TemplateID)
+	if p.WorkingDirectory == nil {
+		return repoRoot, nil
+	}
+
+	wd := filepath.Join(repoRoot, *p.WorkingDirectory)
+	relPath, err := filepath.Rel(repoRoot, wd)
+	if err != nil {
+		return "", fmt.Errorf("resolve working directory relative to repository: %w", err)
+	}
+	if !filepath.IsLocal(relPath) {
+		return "", fmt.Errorf("working directory %q is outside repository %q", wd, repoRoot)
+	}
+
+	return wd, nil
 }
 
 func (p AnsiblePlaybook) runCmd(command string, args []string, environmentVars []string) error {
-	cmd := p.makeCmd(command, args, environmentVars)
-	p.Logger.LogCmd(cmd)
-	err := cmd.Run()
-	// Wait for all log processing to complete before returning
-	p.Logger.WaitLog()
-	return err
+	cmd, err := p.makeCmd(command, args, environmentVars)
+	if err != nil {
+		return err
+	}
+
+	finishLog := p.Logger.LogCmd(cmd)
+	defer finishLog()
+	return cmd.Run()
 }
 
-func (p AnsiblePlaybook) RunPlaybook(args []string, environmentVars []string, inputs map[string]string, cb func(*os.Process)) error {
-	cmd := p.makeCmd("ansible-playbook", args, environmentVars)
-	p.Logger.LogCmd(cmd)
+func (p AnsiblePlaybook) RunPlaybook(args []string, environmentVars []string, inputs map[string]string, stopCh <-chan struct{}) error {
+	cmd, err := p.makeCmd("ansible-playbook", args, environmentVars)
+	if err != nil {
+		return err
+	}
+
+	cmd.WaitDelay = 250 * time.Millisecond
+	finishLog := p.Logger.LogCmd(cmd)
+	defer finishLog()
+
+	// This is the last pre-run cancellation check. The check and pty.Start are
+	// not atomic; if cancellation wins between them, waitCommand stops the process.
+	select {
+	case <-stopCh:
+		return nil
+	default:
+	}
 
 	ptmx, err := pty.Start(cmd)
 
@@ -86,18 +128,15 @@ func (p AnsiblePlaybook) RunPlaybook(args []string, environmentVars []string, in
 	}()
 
 	defer func() { _ = ptmx.Close() }()
-	cb(cmd.Process)
-	err = cmd.Wait()
-	// Wait for all log processing to complete before returning
-	p.Logger.WaitLog()
+	err = waitCommand(cmd, stopCh, p.Logger)
+	finishLog()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		p.Logger.Logf("Ansible command output draining exceeded %s and was stopped", cmd.WaitDelay)
+		return nil
+	}
 	return err
 }
 
 func (p AnsiblePlaybook) RunGalaxy(args []string, environmentVars []string) error {
 	return p.runCmd("ansible-galaxy", args, environmentVars)
-}
-
-func (p AnsiblePlaybook) GetFullPath() (path string) {
-	path = p.Repository.GetFullPath(p.TemplateID)
-	return
 }

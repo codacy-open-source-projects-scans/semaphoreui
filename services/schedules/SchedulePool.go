@@ -1,17 +1,20 @@
 package schedules
 
 import (
-	"strconv"
+	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/semaphoreui/semaphore/pkg/common_errors"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/services/server"
 	"github.com/semaphoreui/semaphore/util"
 
 	"github.com/robfig/cron/v3"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/db_lib"
+	"github.com/semaphoreui/semaphore/pkg/task_logger"
 	"github.com/semaphoreui/semaphore/services/tasks"
 	log "github.com/sirupsen/logrus"
 )
@@ -69,11 +72,21 @@ func (r ScheduleRunner) tryUpdateScheduleCommitHash(schedule db.Schedule) (updat
 		return
 	}
 
+	// The project may map this host to another credential, the same as it would
+	// for a task.
+	hostConfigs, err := db_lib.InstallProjectHostConfigs(
+		r.pool.store, r.pool.encryptionService, schedule.ProjectID, task_logger.NopLogger{})
+	if err != nil {
+		return
+	}
+	defer hostConfigs.Destroy()
+
 	remoteHash, err := db_lib.GitRepository{
-		Logger:     nil,
-		TemplateID: schedule.TemplateID,
-		Repository: repo,
-		Client:     db_lib.CreateDefaultGitClient(r.keyInstaller),
+		Logger:      nil,
+		TemplateID:  schedule.TemplateID,
+		Repository:  repo,
+		Client:      db_lib.CreateDefaultGitClient(r.keyInstaller),
+		HostConfigs: hostConfigs,
 	}.GetLastRemoteCommitHash()
 
 	if err != nil {
@@ -94,11 +107,6 @@ func (r ScheduleRunner) tryUpdateScheduleCommitHash(schedule db.Schedule) (updat
 }
 
 func (r ScheduleRunner) Run() {
-	if !r.pool.store.PermanentConnection() {
-		r.pool.store.Connect("schedule " + strconv.Itoa(r.scheduleID))
-		defer r.pool.store.Close("schedule " + strconv.Itoa(r.scheduleID))
-	}
-
 	schedule, err := r.pool.store.GetSchedule(r.projectID, r.scheduleID)
 	if err != nil {
 		log.WithError(err).WithFields(log.Fields{
@@ -167,7 +175,9 @@ func (r ScheduleRunner) Run() {
 	}
 	task.ScheduleID = &schedule.ID
 
-	_, err = r.pool.taskPool.AddTask(
+	_, err = r.pool.taskPool.AddTaskFrom(
+		audit.WithActor(context.Background(), audit.SystemActor(audit.ComponentScheduler)),
+		audit.TriggerSchedule,
 		task,
 		nil,
 		"",
@@ -311,7 +321,7 @@ func (p *SchedulePool) Refresh() {
 			if !runAt.After(now) {
 				if schedule.DeleteAfterRun {
 					err = p.store.DeleteSchedule(schedule.ProjectID, schedule.ID)
-					if err != nil {
+					if err != nil && !errors.Is(err, db.ErrNotFound) {
 						log.WithError(err).WithFields(log.Fields{
 							"context":     common_errors.GetErrorContext(),
 							"project_id":  schedule.ProjectID,

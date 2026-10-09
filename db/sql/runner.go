@@ -9,7 +9,7 @@ import (
 
 func validateTag(tag string) error {
 	if tag == "" {
-		return fmt.Errorf("Tag cannot be empty")
+		return fmt.Errorf("tag cannot be empty")
 	}
 
 	return nil
@@ -72,7 +72,7 @@ func (d *SqlDb) GetRunners(projectID int, activeOnly bool, tagFilterMode db.Runn
 		}
 
 		if activeOnly {
-			builder = builder.Where("active=?", activeOnly)
+			builder = builder.Where("active=true and token != ''")
 		}
 
 		return builder

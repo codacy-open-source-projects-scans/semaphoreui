@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/semaphoreui/semaphore/pkg/git"
 	"github.com/semaphoreui/semaphore/pkg/tz"
 
 	"github.com/go-gorp/gorp/v3"
@@ -27,20 +28,26 @@ type TerraformTaskParams struct {
 }
 
 type AnsibleTaskParams struct {
-	Debug      bool     `json:"debug"`
-	DebugLevel int      `json:"debug_level"`
-	DryRun     bool     `json:"dry_run"`
-	Diff       bool     `json:"diff"`
-	Limit      []string `json:"limit"`
-	Tags       []string `json:"tags"`
-	SkipTags   []string `json:"skip_tags"`
+	Debug             bool     `json:"debug"`
+	DebugLevel        int      `json:"debug_level"`
+	DryRun            bool     `json:"dry_run"`
+	Diff              bool     `json:"diff"`
+	Limit             []string `json:"limit"`
+	Tags              []string `json:"tags"`
+	SkipTags          []string `json:"skip_tags"`
+	SkipGalaxyInstall bool     `json:"skip_galaxy_install"`
 }
 
 // Task is a model of a task which will be executed by the runner
 type Task struct {
 	ID         int `db:"id" json:"id"`
-	TemplateID int `db:"template_id" json:"template_id" binding:"required"`
+	TemplateID int `db:"template_id" json:"template_id"`
 	ProjectID  int `db:"project_id" json:"project_id"`
+
+	// TemplateName allows a task to reference its template by name instead of
+	// by id when it is created through the API. It is resolved to TemplateID by
+	// the API and never stored.
+	TemplateName string `db:"-" json:"template_name,omitempty"`
 
 	Status task_logger.TaskStatus `db:"status" json:"status"`
 
@@ -69,8 +76,15 @@ type Task struct {
 	CommitHash *string `db:"commit_hash" json:"commit_hash,omitempty"`
 	// CommitMessage contains message retrieved from git repository after checkout to CommitHash.
 	// It is readonly by API.
-	CommitMessage string `db:"commit_message" json:"commit_message,omitempty"`
-	BuildTaskID   *int   `db:"build_task_id" json:"build_task_id,omitempty"`
+	CommitMessage  string `db:"commit_message" json:"commit_message,omitempty"`
+	BuildTaskID    *int   `db:"build_task_id" json:"build_task_id,omitempty"`
+	WorkflowRunID  *int   `db:"workflow_run_id" json:"workflow_run_id,omitempty"`
+	WorkflowNodeID *int   `db:"workflow_node_id" json:"workflow_node_id,omitempty"`
+	// WorkflowTemplateID is the workflow the run of WorkflowRunID belongs to.
+	// It is not stored with the task: the server resolves it from the run before
+	// the task starts so that executors (local or on a remote runner) can expose
+	// the workflow in the task environment without a database.
+	WorkflowTemplateID *int `db:"-" json:"workflow_template_id,omitempty"`
 	// Version is a build version.
 	// This field available only for Build tasks.
 	Version *string `db:"version" json:"version,omitempty"`
@@ -78,6 +92,8 @@ type Task struct {
 	InventoryID *int `db:"inventory_id" json:"inventory_id,omitempty"`
 
 	Params MapStringAnyField `db:"params" json:"params,omitempty"`
+
+	Artifacts *string `db:"artifacts" json:"artifacts,omitempty"`
 
 	// Limit is deprecated, use Params.Limit instead
 	Limit string `db:"-" json:"limit"`
@@ -161,11 +177,34 @@ func (task *Task) GetUrl() *string {
 	return nil
 }
 
+// GetWorkflowUrl returns the URL of the workflow run page the task belongs to,
+// or nil when the task is not part of a workflow run or the web host is unknown.
+func (task *Task) GetWorkflowUrl() *string {
+	if util.Config.WebHost == "" || task.WorkflowRunID == nil || task.WorkflowTemplateID == nil {
+		return nil
+	}
+
+	workflowUrl := fmt.Sprintf("%s/project/%d/workflows/%d/runs/%d",
+		util.Config.WebHost, task.ProjectID, *task.WorkflowTemplateID, *task.WorkflowRunID)
+
+	return &workflowUrl
+}
+
 func (task *Task) ValidateNewTask(template Template) error {
 	if task.GitBranch != nil {
-		if err := ValidateGitBranch(*task.GitBranch, "task"); err != nil {
+		if err := git.ValidateGitBranch(*task.GitBranch, "task"); err != nil {
 			return err
 		}
+	}
+
+	if task.CommitHash != nil {
+		if err := git.ValidateCommitHash(*task.CommitHash, "task"); err != nil {
+			return err
+		}
+	}
+
+	if err := ValidatePlaybookPath(task.Playbook, "task"); err != nil {
+		return err
 	}
 
 	var params any
@@ -203,7 +242,12 @@ type TaskWithTpl struct {
 	TemplateType     TemplateType `db:"tpl_type" json:"tpl_type,omitempty"`
 	TemplateApp      TemplateApp  `db:"tpl_app" json:"tpl_app,omitempty"`
 	UserName         *string      `db:"user_name" json:"user_name,omitempty"`
-	BuildTask        *Task        `db:"-" json:"build_task,omitempty"`
+	// UsedRunnerID exposes Task.RunnerID through the API. Task.RunnerID itself
+	// stays unexported (json:"-"); we re-select it under a distinct column so the
+	// embedded struct's mapping is not duplicated.
+	UsedRunnerID   *int    `db:"used_runner_id" json:"used_runner_id,omitempty"`
+	UsedRunnerName *string `db:"used_runner_name" json:"used_runner_name,omitempty"`
+	BuildTask      *Task   `db:"-" json:"build_task,omitempty"`
 }
 
 // TaskOutput is the ansible log output from the task

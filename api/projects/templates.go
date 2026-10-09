@@ -1,21 +1,25 @@
 package projects
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/semaphoreui/semaphore/util"
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/services/audit"
+	log "github.com/sirupsen/logrus"
 )
 
 // TemplatesMiddleware ensures a template exists and loads it to the context
 func TemplatesMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		project := helpers.GetFromContext(r, "project").(db.Project)
-		templateID, err := helpers.GetIntParam("template_id", w, r)
-		if err != nil {
+		templateID, ok := helpers.GetIntParamOrAbort("template_id", w, r)
+		if !ok {
 			return
 		}
 
@@ -106,12 +110,18 @@ func AddTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := util.Config.Apps[string(newTemplate.App)]; !ok {
-		helpers.WriteErrorStatus(w, "Invalid app id: "+string(newTemplate.App), http.StatusBadRequest)
-		return
-	}
-
 	// Check workspace and create it if required.
+	createdInventoryID := 0
+	// The template row exists, so a failed inventory step is still recorded.
+	recordPartial := func() {
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:      audit.ResourceTemplateCreate,
+			Target:    audit.ResourceTarget(audit.TargetTemplate, newTemplate.ID, newTemplate.Name),
+			ProjectID: project.ID,
+			Reason:    audit.ReasonInventoryFailed,
+			Metadata:  audit.TemplateMetadata{App: string(newTemplate.App), CreatedInventoryID: createdInventoryID, Partial: true},
+		})
+	}
 	if newTemplate.App.IsTerraform() {
 		var inv db.Inventory
 
@@ -121,6 +131,7 @@ func AddTemplate(w http.ResponseWriter, r *http.Request) {
 			if invTypes := newTemplate.App.InventoryTypes(); len(invTypes) > 0 {
 				inventoryType = invTypes[0]
 			} else {
+				recordPartial()
 				helpers.WriteErrorStatus(w, "Inventory type is not supported for this template", http.StatusBadRequest)
 				return
 			}
@@ -134,16 +145,19 @@ func AddTemplate(w http.ResponseWriter, r *http.Request) {
 			})
 
 			if err != nil {
+				recordPartial()
 				helpers.WriteError(w, err)
 				return
 			}
 
+			createdInventoryID = inv.ID
 			newTemplate.InventoryID = &inv.ID
 			err = helpers.Store(r).UpdateTemplate(newTemplate)
 
 		} else {
 			inv, err = helpers.Store(r).GetInventory(project.ID, *newTemplate.InventoryID)
 			if err != nil {
+				recordPartial()
 				helpers.WriteError(w, err)
 				return
 			}
@@ -153,6 +167,7 @@ func AddTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err != nil {
+			recordPartial()
 			helpers.WriteError(w, err)
 			return
 		}
@@ -164,6 +179,14 @@ func AddTemplate(w http.ResponseWriter, r *http.Request) {
 		ObjectType:  db.EventSchedule,
 		ObjectID:    newTemplate.ID,
 		Description: fmt.Sprintf("Template ID %d created", newTemplate.ID),
+	})
+
+	// The inventory created for a Terraform template has no event of its own.
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateCreate,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, newTemplate.ID, newTemplate.Name),
+		ProjectID: project.ID,
+		Metadata:  audit.TemplateMetadata{App: string(newTemplate.App), CreatedInventoryID: createdInventoryID},
 	})
 
 	helpers.WriteJSON(w, http.StatusCreated, newTemplate)
@@ -253,6 +276,13 @@ func UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Template ID %d updated", template.ID),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateUpdate,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, oldTemplate.ID, template.Name),
+		ProjectID: oldTemplate.ProjectID,
+		Metadata:  audit.TemplateMetadata{App: string(template.App)},
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -272,6 +302,12 @@ func RemoveTemplate(w http.ResponseWriter, r *http.Request) {
 		ObjectType:  db.EventTemplate,
 		ObjectID:    tpl.ID,
 		Description: fmt.Sprintf("Template ID %d deleted", tpl.ID),
+	})
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateDelete,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, tpl.ID, tpl.Name),
+		ProjectID: tpl.ProjectID,
 	})
 
 	w.WriteHeader(http.StatusNoContent)
@@ -298,6 +334,13 @@ func SetTemplateInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateSetDefaultInventory,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, tpl.ID, tpl.Name),
+		ProjectID: tpl.ProjectID,
+		Metadata:  audit.TemplateInventoryMetadata{InventoryID: inv.ID},
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -322,6 +365,13 @@ func AttachInventory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateAttachInventory,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, tpl.ID, tpl.Name),
+		ProjectID: tpl.ProjectID,
+		Metadata:  audit.TemplateInventoryMetadata{InventoryID: inv.ID},
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -340,6 +390,13 @@ func DetachInventory(w http.ResponseWriter, r *http.Request) {
 		helpers.WriteError(w, err)
 		return
 	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.ResourceTemplateDetachInventory,
+		Target:    audit.ResourceTarget(audit.TargetTemplate, tpl.ID, tpl.Name),
+		ProjectID: tpl.ProjectID,
+		Metadata:  audit.TemplateInventoryMetadata{InventoryID: inv.ID},
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -364,6 +421,10 @@ func (c *TemplateController) AddTemplatePerm(w http.ResponseWriter, r *http.Requ
 	if !helpers.Bind(w, r, &perm) {
 		return
 	}
+	if perm.Permissions&^db.KnownRolePermissions != 0 {
+		helpers.WriteErrorStatus(w, "Permissions contain unknown bits", http.StatusBadRequest)
+		return
+	}
 
 	perm.ProjectID = template.ProjectID
 	perm.TemplateID = template.ID
@@ -374,13 +435,25 @@ func (c *TemplateController) AddTemplatePerm(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.IAMTemplatePermissionCreate,
+		Target:    &audit.Target{Type: audit.TargetTemplatePermission, ID: strconv.Itoa(newPerm.ID)},
+		ProjectID: template.ProjectID,
+		Metadata: audit.TemplatePermissionMetadata{
+			TemplateID: template.ID,
+			// The slug comes from the request body, and SQLite does not enforce column lengths.
+			RoleSlug:    audit.TruncateName(newPerm.RoleSlug, audit.MaxNameBytes),
+			Permissions: audit.PermissionNames(newPerm.Permissions),
+		},
+	})
+
 	helpers.WriteJSON(w, http.StatusCreated, newPerm)
 }
 
 func (c *TemplateController) UpdateTemplatePerm(w http.ResponseWriter, r *http.Request) {
 	template := helpers.GetFromContext(r, "template").(db.Template)
-	permID, err := helpers.GetIntParam("perm_id", w, r)
-	if err != nil {
+	permID, ok := helpers.GetIntParamOrAbort("perm_id", w, r)
+	if !ok {
 		return
 	}
 
@@ -388,41 +461,73 @@ func (c *TemplateController) UpdateTemplatePerm(w http.ResponseWriter, r *http.R
 	if !helpers.Bind(w, r, &perm) {
 		return
 	}
+	if perm.Permissions&^db.KnownRolePermissions != 0 {
+		helpers.WriteErrorStatus(w, "Permissions contain unknown bits", http.StatusBadRequest)
+		return
+	}
 
 	perm.ID = permID
 	perm.ProjectID = template.ProjectID
 	perm.TemplateID = template.ID
 
-	err = c.templateRepo.UpdateTemplateRole(perm)
+	err := c.templateRepo.UpdateTemplateRole(perm)
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
+
+	// The update changes only permissions, so the role comes from the stored rule.
+	roleSlug := ""
+	if stored, getErr := c.templateRepo.GetTemplateRole(template.ProjectID, template.ID, permID); getErr == nil {
+		roleSlug = stored.RoleSlug
+	} else {
+		log.WithError(getErr).WithField("context", "audit").Error("Cannot read the template permission for the audit")
+	}
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.IAMTemplatePermissionUpdate,
+		Target:    &audit.Target{Type: audit.TargetTemplatePermission, ID: strconv.Itoa(permID)},
+		ProjectID: template.ProjectID,
+		Metadata: audit.TemplatePermissionMetadata{
+			TemplateID:  template.ID,
+			RoleSlug:    audit.TruncateName(roleSlug, audit.MaxNameBytes),
+			Permissions: audit.PermissionNames(perm.Permissions),
+		},
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (c *TemplateController) DeleteTemplatePerm(w http.ResponseWriter, r *http.Request) {
 	template := helpers.GetFromContext(r, "template").(db.Template)
-	permID, err := helpers.GetIntParam("perm_id", w, r)
-	if err != nil {
+	permID, ok := helpers.GetIntParamOrAbort("perm_id", w, r)
+	if !ok {
 		return
 	}
 
-	err = c.templateRepo.DeleteTemplateRole(template.ProjectID, template.ID, permID)
+	err := c.templateRepo.DeleteTemplateRole(template.ProjectID, template.ID, permID)
+	if errors.Is(err, db.ErrNotFound) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.IAMTemplatePermissionDelete,
+		Target:    &audit.Target{Type: audit.TargetTemplatePermission, ID: strconv.Itoa(permID)},
+		ProjectID: template.ProjectID,
+		Metadata:  audit.TemplatePermissionMetadata{TemplateID: template.ID},
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (c *TemplateController) GetTemplatePerm(w http.ResponseWriter, r *http.Request) {
 	template := helpers.GetFromContext(r, "template").(db.Template)
-	permID, err := helpers.GetIntParam("perm_id", w, r)
-	if err != nil {
-		helpers.WriteError(w, err)
+	permID, ok := helpers.GetIntParamOrAbort("perm_id", w, r)
+	if !ok {
 		return
 	}
 

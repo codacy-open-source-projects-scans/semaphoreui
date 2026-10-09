@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	htmltemplate "html/template"
 	"net/http"
 	"strconv"
 	"text/template"
@@ -38,8 +39,22 @@ type alertChat struct {
 	ID string
 }
 
+func (t *TaskRunner) shouldSkipStatusAlert() bool {
+	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+		return true
+	}
+	if t.Template.SuppressErrorAlerts && t.Task.Status == task_logger.TaskFailStatus {
+		return true
+	}
+	return false
+}
+
 func (t *TaskRunner) sendMailAlert() {
 	if !util.Config.EmailAlert || !t.alert {
+		return
+	}
+
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -59,7 +74,7 @@ func (t *TaskRunner) sendMailAlert() {
 		},
 	}
 
-	tpl, err := template.ParseFS(templates, "templates/email.tmpl")
+	tpl, err := htmltemplate.ParseFS(templates, "templates/email.tmpl")
 
 	if err != nil {
 		t.Log("Can't parse email alert template!")
@@ -90,6 +105,7 @@ func (t *TaskRunner) sendMailAlert() {
 
 		t.Logf("Attempting to send email alert to %s", user.Email)
 
+		str := body.String()
 		if err := mailer.Send(
 			util.Config.EmailSecure,
 			util.Config.EmailTls,
@@ -100,7 +116,7 @@ func (t *TaskRunner) sendMailAlert() {
 			util.Config.EmailSender,
 			user.Email,
 			fmt.Sprintf("Task '%s' failed", t.Template.Name),
-			body.String(),
+			str,
 		); err != nil {
 			util.LogError(err)
 			continue
@@ -115,7 +131,7 @@ func (t *TaskRunner) sendTelegramAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -193,7 +209,7 @@ func (t *TaskRunner) sendSlackAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -256,7 +272,7 @@ func (t *TaskRunner) sendRocketChatAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -318,7 +334,7 @@ func (t *TaskRunner) sendMicrosoftTeamsAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -380,7 +396,7 @@ func (t *TaskRunner) sendDingTalkAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 
@@ -443,7 +459,7 @@ func (t *TaskRunner) sendGotifyAlert() {
 		return
 	}
 
-	if t.Template.SuppressSuccessAlerts && t.Task.Status == task_logger.TaskSuccessStatus {
+	if t.shouldSkipStatusAlert() {
 		return
 	}
 

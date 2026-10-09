@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -14,7 +15,9 @@ import (
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pkg/tz"
 	"github.com/semaphoreui/semaphore/pro_interfaces"
+	"github.com/semaphoreui/semaphore/services/audit"
 	"github.com/semaphoreui/semaphore/util"
+	log "github.com/sirupsen/logrus"
 )
 
 type UserController struct {
@@ -46,6 +49,71 @@ func (c *UserController) GetUser(w http.ResponseWriter, r *http.Request) {
 		user.Pro = false
 	}
 	helpers.WriteJSON(w, http.StatusOK, user)
+}
+
+// linkLdapIdentity attaches an LDAP identity to the current account.
+// Proof of ownership is a successful bind with the user's own LDAP credentials.
+func linkLdapIdentity(w http.ResponseWriter, r *http.Request) {
+	currentUser := helpers.GetFromContext(r, "user").(*db.User)
+
+	var creds struct {
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
+		Provider string `json:"provider"` // LDAP provider ID, default "ldap"
+	}
+	if !helpers.Bind(w, r, &creds) {
+		return
+	}
+
+	providerID := creds.Provider
+	if providerID == "" {
+		providerID = "ldap"
+	}
+
+	provider, ok := util.Config.GetLdapProvider(providerID)
+	if !ok {
+		helpers.WriteErrorStatus(w, "LDAP provider not found", http.StatusBadRequest)
+		return
+	}
+
+	ldapUser, userDN, err := tryFindLDAPUser(provider, creds.Username, creds.Password)
+	if err != nil || ldapUser == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	if !ldapProfileMatchesSemaphoreUser(*ldapUser, *currentUser) {
+		helpers.WriteErrorStatus(w, "LDAP directory profile does not match your account", http.StatusForbidden)
+		return
+	}
+
+	linked, err := linkExternalIdentity(helpers.Store(r), *currentUser, db.IdentityTypeLdap, providerID, userDN)
+	if err != nil {
+		switch {
+		case errors.Is(err, errIdentityLinkedToAnother):
+			helpers.WriteErrorStatus(w, "This LDAP account is already linked to another user.", http.StatusConflict)
+		case errors.Is(err, errProviderAlreadyLinked):
+			helpers.WriteErrorStatus(w, "Your account already has a linked LDAP identity. Unlink it first.", http.StatusConflict)
+		default:
+			log.WithError(err).WithFields(log.Fields{
+				"provider": providerID,
+				"user_dn":  userDN,
+				"context":  "ldap",
+			}).Warn("Failed to link LDAP identity")
+			helpers.WriteErrorStatus(w, "Failed to link LDAP account", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	if linked {
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:     audit.IAMExternalIdentityLink,
+			Target:   audit.UserTarget(currentUser.ID, currentUser.Username),
+			Metadata: audit.AuthMethodMetadata{Method: audit.LoginMethodLDAP, Provider: providerID},
+		})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func getAPITokens(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +169,11 @@ func createAPIToken(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:   audit.IAMAPITokenCreate,
+		Target: &audit.Target{Type: audit.TargetAPIToken, ID: audit.TokenFingerprint(token.ID), Name: token.Name},
+	})
+
 	helpers.WriteJSON(w, http.StatusCreated, token)
 }
 
@@ -109,11 +182,25 @@ func deleteAPIToken(w http.ResponseWriter, r *http.Request) {
 
 	tokenID := mux.Vars(r)["token_id"]
 
-	err := helpers.Store(r).DeleteAPIToken(user.ID, tokenID)
-
+	tokens, err := helpers.Store(r).GetAPITokensByPrefix(user.ID, tokenID)
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
+	}
+
+	for _, token := range tokens {
+		err = helpers.Store(r).DeleteAPIToken(user.ID, token.ID)
+		if errors.Is(err, db.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			helpers.WriteError(w, err)
+			return
+		}
+		helpers.Audit(r).Record(r.Context(), audit.Event{
+			Kind:   audit.IAMAPITokenDelete,
+			Target: &audit.Target{Type: audit.TargetAPIToken, ID: audit.TokenFingerprint(token.ID), Name: token.Name},
+		})
 	}
 
 	w.WriteHeader(http.StatusNoContent)

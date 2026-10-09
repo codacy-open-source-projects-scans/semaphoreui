@@ -9,6 +9,7 @@ import (
 
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/services/audit"
 )
 
 type KeyController struct {
@@ -27,8 +28,8 @@ func NewKeyController(
 func KeyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		project := helpers.GetFromContext(r, "project").(db.Project)
-		keyID, err := helpers.GetIntParam("key_id", w, r)
-		if err != nil {
+		keyID, ok := helpers.GetIntParamOrAbort("key_id", w, r)
+		if !ok {
 			return
 		}
 
@@ -36,6 +37,13 @@ func KeyMiddleware(next http.Handler) http.Handler {
 
 		if err != nil {
 			helpers.WriteError(w, err)
+			return
+		}
+
+		// Task-bound survey-secret keys are internal: they must not be
+		// readable or mutable through the generic key endpoints.
+		if key.Owner == db.AccessKeyTaskSecret {
+			helpers.WriteError(w, db.ErrNotFound)
 			return
 		}
 
@@ -97,6 +105,14 @@ func (c *KeyController) AddKey(w http.ResponseWriter, r *http.Request) {
 	key.IgnorePlain = true
 	key.Synchronized = false
 
+	// Task-bound survey-secret keys are created internally at task start only.
+	if key.Owner == db.AccessKeyTaskSecret {
+		helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Invalid key owner",
+		})
+		return
+	}
+
 	//if err := key.Validate(true); err != nil {
 	//	helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
 	//		"error": err.Error(),
@@ -119,12 +135,20 @@ func (c *KeyController) AddKey(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Access Key %s created", key.Name),
 	})
 
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.SecretCredentialCreate,
+		Target:    audit.ResourceTarget(audit.TargetCredential, newKey.ID, key.Name),
+		ProjectID: *newKey.ProjectID,
+		Metadata:  audit.CredentialMetadata{Type: string(key.Type)},
+	})
+
 	// Reload key to drop sensitive fields
 	key, err = helpers.Store(r).GetAccessKey(*newKey.ProjectID, newKey.ID)
 	if err != nil {
 		helpers.WriteError(w, err)
 		return
 	}
+	key.Plain = newKey.Plain
 
 	helpers.WriteJSON(w, http.StatusCreated, key)
 }
@@ -136,6 +160,21 @@ func (c *KeyController) UpdateKey(w http.ResponseWriter, r *http.Request) {
 	oldKey := helpers.GetFromContext(r, "accessKey").(db.AccessKey)
 
 	if !helpers.Bind(w, r, &key) {
+		return
+	}
+
+	// access key ID and project ID in the body and the path must be the same
+	if key.ID != oldKey.ID {
+		helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "Access key id in URL and in body must be the same",
+		})
+		return
+	}
+
+	if oldKey.ProjectID == nil || key.ProjectID == nil || *key.ProjectID != *oldKey.ProjectID {
+		helpers.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "You can not move access key to other project",
+		})
 		return
 	}
 
@@ -184,6 +223,19 @@ func (c *KeyController) UpdateKey(w http.ResponseWriter, r *http.Request) {
 		Description: fmt.Sprintf("Access Key %s updated", key.Name),
 	})
 
+	// The type is stored only together with the secret.
+	storedType := oldKey.Type
+	if key.OverrideSecret {
+		storedType = key.Type
+	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.SecretCredentialUpdate,
+		Target:    audit.ResourceTarget(audit.TargetCredential, oldKey.ID, key.Name),
+		ProjectID: *oldKey.ProjectID,
+		Metadata:  audit.CredentialMetadata{Type: string(storedType)},
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -211,6 +263,12 @@ func (c *KeyController) RemoveKey(w http.ResponseWriter, r *http.Request) {
 		ObjectType:  db.EventKey,
 		ObjectID:    key.ID,
 		Description: fmt.Sprintf("Access Key %s deleted", key.Name),
+	})
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:      audit.SecretCredentialDelete,
+		Target:    audit.ResourceTarget(audit.TargetCredential, key.ID, key.Name),
+		ProjectID: *key.ProjectID,
 	})
 
 	w.WriteHeader(http.StatusNoContent)

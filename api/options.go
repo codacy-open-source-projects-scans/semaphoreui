@@ -1,9 +1,11 @@
 package api
 
 import (
+	"net/http"
+
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
-	"net/http"
+	"github.com/semaphoreui/semaphore/services/audit"
 )
 
 func setOption(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +30,11 @@ func setOption(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	helpers.Audit(r).Record(r.Context(), audit.Event{
+		Kind:     audit.SystemSettingsUpdate,
+		Metadata: audit.SettingsMetadata{Keys: []string{audit.TruncateName(option.Key, audit.MaxNameBytes)}},
+	})
 
 	helpers.WriteJSON(w, http.StatusOK, option)
 }

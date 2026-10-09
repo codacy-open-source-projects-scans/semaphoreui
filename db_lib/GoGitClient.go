@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/semaphoreui/semaphore/db"
+	"github.com/semaphoreui/semaphore/pkg/common_errors"
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
 	"github.com/semaphoreui/semaphore/util"
 
@@ -39,6 +40,15 @@ func (t ProgressWrapper) Write(p []byte) (n int, err error) {
 }
 
 func (c GoGitClient) getAuthMethod(r GitRepository) (transport.AuthMethod, error) {
+	// go-git speaks the protocols itself and reads neither the generated ssh
+	// config nor the git rewrites, and every remote operation comes through here.
+	// Failing is better than ignoring the mappings and reaching the host with the
+	// repository credential instead.
+	if r.HostConfigs != nil {
+		return nil, common_errors.NewUserErrorS(
+			"host config mappings are not supported by the go_git client, use git_client: cmd_git")
+	}
+
 	switch r.Repository.SSHKey.Type {
 	case db.AccessKeySSH:
 
@@ -47,7 +57,7 @@ func (c GoGitClient) getAuthMethod(r GitRepository) (transport.AuthMethod, error
 			return nil, err
 		}
 
-		defer install.Destroy()
+		defer install.Destroy() //nolint:errcheck
 
 		var sshKeyBuff = r.Repository.SSHKey.SshKey.PrivateKey
 
@@ -94,7 +104,7 @@ func openRepository(r GitRepository, targetDir GitRepositoryDirType) (*git.Repos
 }
 
 func (c GoGitClient) Clone(r GitRepository) error {
-	r.Logger.Log("Cloning Repository " + r.Repository.GitURL)
+	r.Logger.Log("Cloning Repository " + r.Repository.GetRedactedGitURL())
 
 	authMethod, authErr := c.getAuthMethod(r)
 
@@ -103,7 +113,7 @@ func (c GoGitClient) Clone(r GitRepository) error {
 	}
 
 	cloneOpt := &git.CloneOptions{
-		URL:               r.Repository.GetGitURL(true),
+		URL:               r.Repository.GetGitURL(false),
 		Progress:          ProgressWrapper{r.Logger},
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
 		ReferenceName:     plumbing.NewBranchReferenceName(r.Repository.GitBranch),
@@ -119,7 +129,7 @@ func (c GoGitClient) Clone(r GitRepository) error {
 }
 
 func (c GoGitClient) Pull(r GitRepository) error {
-	r.Logger.Log("Updating Repository " + r.Repository.GitURL)
+	r.Logger.Log("Updating Repository " + r.Repository.GetRedactedGitURL())
 
 	rep, err := openRepository(r, GitRepositoryFullPath)
 	if err != nil {
@@ -138,6 +148,7 @@ func (c GoGitClient) Pull(r GitRepository) error {
 
 	// Pull the latest changes from the origin remote and merge into the current branch
 	err = wt.Pull(&git.PullOptions{RemoteName: "origin",
+		ReferenceName:     plumbing.NewBranchReferenceName(r.Repository.GitBranch),
 		Auth:              authMethod,
 		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth})
 	if err != nil && err != git.NoErrAlreadyUpToDate {
@@ -230,10 +241,7 @@ func (c GoGitClient) GetLastCommitMessage(r GitRepository) (msg string, err erro
 		return
 	}
 
-	msg = headCommit.Message
-	if len(msg) > 100 {
-		msg = msg[0:100]
-	}
+	msg = truncateCommitMessage(headCommit.Message)
 
 	r.Logger.Log("Message: " + msg)
 

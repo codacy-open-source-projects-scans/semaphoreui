@@ -12,28 +12,63 @@
       dense
     ></v-text-field>
 
-    <v-combobox
-      v-model="item.tags"
-      :label="$t('Tags')"
-      :items="tagSuggestions || []"
-      :rules="
-        projectId ? [
-          (v) => (item.is_default || Array.isArray(v) && v.length > 0) || $t('tag_required')
-        ] : []
-      "
-      :required="!!projectId"
-      :disabled="formSaving"
-      :loading="tagSuggestions == null"
-      multiple
-      chips
-      deletable-chips
-      small-chips
-      hide-selected
-      outlined
-      hide-details
-    ></v-combobox>
+    <div style="position: relative">
+      <v-combobox
+        v-model="item.tags"
+        :label="$t('Tags')"
+        :items="tagSuggestions || []"
+        :rules="
+          projectId
+            ? [(v) => item.is_default || (Array.isArray(v) && v.length > 0) || $t('tag_required')]
+            : []
+        "
+        :required="!!projectId"
+        :disabled="formSaving || !isTagsAvailable"
+        :loading="tagSuggestions == null"
+        multiple
+        chips
+        deletable-chips
+        small-chips
+        hide-selected
+        outlined
+        hide-details
+      />
 
-    <v-checkbox label="Is default" v-model="item.is_default" />
+      <v-chip
+        v-if="!isTagsAvailable"
+        color="hsl(348deg, 86%, 61%)"
+        text-color="white"
+        small
+        label
+        style="position: absolute; top: -10px; right: 15px"
+        @click="upgradeToPro('runners')"
+      >
+        Upgrade to PRO
+      </v-chip>
+    </div>
+
+    <v-row>
+      <v-col>
+        <v-checkbox v-model="item.is_default">
+          <template v-slot:label>
+            Is default
+            <v-chip class="ml-2" color="error" small>New</v-chip>
+          </template>
+        </v-checkbox>
+      </v-col>
+      <v-col>
+        <v-checkbox v-if="isNew" v-model="item.registered" :disabled="formSaving">
+          <template v-slot:label>
+            {{ $t('register') }}
+            <v-chip class="ml-2" color="error" small>New</v-chip>
+          </template>
+        </v-checkbox>
+      </v-col>
+    </v-row>
+
+    <v-alert v-if="isNew && !item.registered" class="mb-4" color="info" dense text>
+      {{ $t('unregisteredRunnerHint') }}
+    </v-alert>
 
     <v-text-field
       v-model="item.webhook"
@@ -55,7 +90,7 @@
     ></v-text-field>
 
     <v-checkbox
-      style="position: absolute; left: 24px; bottom: 15px;"
+      style="position: absolute; left: 24px; bottom: 15px"
       class="mt-0"
       v-model="item.active"
       :label="$t('enabled')"
@@ -72,6 +107,7 @@ export default {
   props: {
     isAdmin: Boolean,
     projectId: Number,
+    isTagsAvailable: Boolean,
   },
 
   mixins: [ItemFormBase],
@@ -96,6 +132,16 @@ export default {
   },
 
   methods: {
+    getNewItem() {
+      // New runners default to "registered": the server returns an auth token as
+      // usual. Unchecking it creates an unregistered runner that must register
+      // itself later using a one-time registration token.
+      return {
+        registered: true,
+        is_default: this.projectId == null,
+      };
+    },
+
     getItemsUrl() {
       if (this.projectId) {
         return `/api/project/${this.projectId}/runners`;

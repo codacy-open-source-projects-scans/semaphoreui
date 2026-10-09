@@ -4,145 +4,220 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/Masterminds/squirrel"
+	sq "github.com/Masterminds/squirrel"
 	"github.com/semaphoreui/semaphore/db"
-	common_errors "github.com/semaphoreui/semaphore/pkg/common_errors"
+	"github.com/semaphoreui/semaphore/pkg/common_errors"
 	log "github.com/sirupsen/logrus"
 )
 
-func (d *SqlDb) CreateTemplate(template db.Template) (newTemplate db.Template, err error) {
-	err = template.Validate()
+// validateTemplateNameIsFree rejects a template name which is already used by
+// another template of the same project, so that a template can be referred to by
+// name. templateID is the template being updated, or 0 when creating one.
+//
+// Templates created before this check may still share a name, which is why
+// GetTemplateByName rejects an ambiguous name rather than relying on this.
+func (d *SqlDb) validateTemplateNameIsFree(projectID int, templateID int, name string) error {
+	var count int
+
+	err := d.selectOne(&count,
+		"select count(*) from project__template where project_id=? and name=? and id<>?",
+		projectID, name, templateID)
 
 	if err != nil {
-		return
+		return err
 	}
 
-	insertID, err := d.insert(
-		"id",
-		"insert into project__template ("+
-			"project_id, inventory_id, repository_id, environment_id, name, "+
-			"playbook, arguments, allow_override_args_in_task, description, `type`, "+
-			"start_version, build_template_id, view_id, autorun, survey_vars, "+
-			"suppress_success_alerts, app, git_branch, runner_tag, task_params, "+
-			"allow_override_branch_in_task, allow_parallel_tasks)"+
-			"values ("+
-			"?, ?, ?, ?, ?, "+
-			"?, ?, ?, ?, ?, "+
-			"?, ?, ?, ?, ?, "+
-			"?, ?, ?, ?, ?,"+
-			"?, ?)",
-		template.ProjectID,
-		template.InventoryID,
-		template.RepositoryID,
-		template.EnvironmentID,
-		template.Name,
+	if count > 0 {
+		return common_errors.NewValidationError("template with name " + name + " already exists")
+	}
 
-		template.Playbook,
-		template.Arguments,
-		template.AllowOverrideArgsInTask,
-		template.Description,
-		template.Type,
+	return nil
+}
 
-		template.StartVersion,
-		template.BuildTemplateID,
-		template.ViewID,
-		template.Autorun,
-		db.ObjectToJSON(template.SurveyVars),
+func (d *SqlDb) CreateTemplate(tmpl db.Template) (db.Template, error) {
+	if err := tmpl.Validate(); err != nil {
+		return db.Template{}, err
+	}
 
-		template.SuppressSuccessAlerts,
-		template.App,
-		template.GitBranch,
-		template.RunnerTag,
-		template.TaskParams,
+	if err := d.validateTemplateNameIsFree(tmpl.ProjectID, 0, tmpl.Name); err != nil {
+		return db.Template{}, err
+	}
 
-		template.AllowOverrideBranchInTask,
-		template.AllowParallelTasks,
+	tmpl.ApplyLegacyEnvironmentField()
+
+	query, args, err := sq.Insert("project__template").
+		SetMap(map[string]any{
+			"project_id":                    tmpl.ProjectID,
+			"inventory_id":                  tmpl.InventoryID,
+			"repository_id":                 tmpl.RepositoryID,
+			"name":                          tmpl.Name,
+			"playbook":                      tmpl.Playbook,
+			"working_directory":             tmpl.WorkingDirectory,
+			"arguments":                     tmpl.Arguments,
+			"allow_override_args_in_task":   tmpl.AllowOverrideArgsInTask,
+			"description":                   tmpl.Description,
+			"`type`":                        tmpl.Type,
+			"start_version":                 tmpl.StartVersion,
+			"build_template_id":             tmpl.BuildTemplateID,
+			"view_id":                       tmpl.ViewID,
+			"autorun":                       tmpl.Autorun,
+			"survey_vars":                   db.ObjectToJSON(tmpl.SurveyVars),
+			"suppress_success_alerts":       tmpl.SuppressSuccessAlerts,
+			"suppress_error_alerts":         tmpl.SuppressErrorAlerts,
+			"app":                           tmpl.App,
+			"git_branch":                    tmpl.GitBranch,
+			"runner_tag":                    tmpl.RunnerTag,
+			"task_params":                   tmpl.TaskParams,
+			"allow_override_branch_in_task": tmpl.AllowOverrideBranchInTask,
+			"allow_parallel_tasks":          tmpl.AllowParallelTasks,
+			"jwt_params":                    tmpl.JWTParams,
+			"executor_image":                tmpl.NormalizedExecutorImage(),
+		}).
+		ToSql()
+	if err != nil {
+		return db.Template{}, err
+	}
+
+	tmplId, err := d.insert("id", query, args...)
+	if err != nil {
+		return db.Template{}, err
+	}
+
+	err = d.UpdateTemplateVaults(tmpl.ProjectID, tmplId, tmpl.Vaults)
+	if err != nil {
+		return db.Template{}, err
+	}
+
+	err = d.UpdateTemplateEnvironments(tmpl.ProjectID, tmplId, tmpl.EnvironmentIDs)
+	if err != nil {
+		return db.Template{}, err
+	}
+
+	tmpl.ID = tmplId
+	if err = db.FillTemplate(d, &tmpl); err != nil {
+		return db.Template{}, err
+	}
+
+	return tmpl, nil
+}
+
+func (d *SqlDb) UpdateTemplate(tmpl db.Template) error {
+	err := tmpl.Validate()
+	if err != nil {
+		return err
+	}
+
+	if err = d.validateTemplateNameIsFree(tmpl.ProjectID, tmpl.ID, tmpl.Name); err != nil {
+		return err
+	}
+
+	query, args, err := sq.Update("project__template").
+		SetMap(map[string]any{
+			"inventory_id":                  tmpl.InventoryID,
+			"repository_id":                 tmpl.RepositoryID,
+			"name":                          tmpl.Name,
+			"playbook":                      tmpl.Playbook,
+			"working_directory":             tmpl.WorkingDirectory,
+			"arguments":                     tmpl.Arguments,
+			"allow_override_args_in_task":   tmpl.AllowOverrideArgsInTask,
+			"description":                   tmpl.Description,
+			"`type`":                        tmpl.Type,
+			"start_version":                 tmpl.StartVersion,
+			"build_template_id":             tmpl.BuildTemplateID,
+			"view_id":                       tmpl.ViewID,
+			"autorun":                       tmpl.Autorun,
+			"survey_vars":                   db.ObjectToJSON(tmpl.SurveyVars),
+			"suppress_success_alerts":       tmpl.SuppressSuccessAlerts,
+			"suppress_error_alerts":         tmpl.SuppressErrorAlerts,
+			"app":                           tmpl.App,
+			"`git_branch`":                  tmpl.GitBranch,
+			"task_params":                   tmpl.TaskParams,
+			"runner_tag":                    tmpl.RunnerTag,
+			"allow_override_branch_in_task": tmpl.AllowOverrideBranchInTask,
+			"allow_parallel_tasks":          tmpl.AllowParallelTasks,
+			"jwt_params":                    tmpl.JWTParams,
+			"executor_image":                tmpl.NormalizedExecutorImage(),
+		}).
+		Where(sq.Eq{
+			"id":         tmpl.ID,
+			"project_id": tmpl.ProjectID,
+		}).
+		ToSql()
+	if err != nil {
+		return err
+	}
+
+	_, err = d.exec(query, args...)
+	if err != nil {
+		return err
+	}
+
+	err = d.UpdateTemplateVaults(tmpl.ProjectID, tmpl.ID, tmpl.Vaults)
+	if err != nil {
+		return err
+	}
+
+	tmpl.ApplyLegacyEnvironmentField()
+	return d.UpdateTemplateEnvironments(tmpl.ProjectID, tmpl.ID, tmpl.EnvironmentIDs)
+}
+
+func (d *SqlDb) GetTemplateEnvironments(projectID int, templateID int) (environmentIDs []int, err error) {
+	environmentIDs = make([]int, 0)
+
+	var rows []struct {
+		EnvironmentID int `db:"environment_id"`
+	}
+
+	_, err = d.selectAll(
+		&rows,
+		"select environment_id from project__template_environment "+
+			"where project_id=? and template_id=? order by environment_id",
+		projectID,
+		templateID,
 	)
 
 	if err != nil {
 		return
 	}
 
-	err = d.UpdateTemplateVaults(template.ProjectID, insertID, template.Vaults)
-	if err != nil {
-		return
+	for _, r := range rows {
+		environmentIDs = append(environmentIDs, r.EnvironmentID)
 	}
-
-	err = db.FillTemplate(d, &newTemplate)
-
-	if err != nil {
-		return
-	}
-
-	newTemplate = template
-	newTemplate.ID = insertID
 
 	return
 }
 
-func (d *SqlDb) UpdateTemplate(template db.Template) error {
-	err := template.Validate()
-
-	if err != nil {
-		return err
-	}
-
-	_, err = d.exec("update project__template set "+
-		"inventory_id=?, "+
-		"repository_id=?, "+
-		"environment_id=?, "+
-		"name=?, "+
-		"playbook=?, "+
-		"arguments=?, "+
-		"allow_override_args_in_task=?, "+
-		"description=?, "+
-		"`type`=?, "+
-		"start_version=?,"+
-		"build_template_id=?, "+
-		"view_id=?, "+
-		"autorun=?, "+
-		"survey_vars=?, "+
-		"suppress_success_alerts=?, "+
-		"app=?, "+
-		"`git_branch`=?, "+
-		"task_params=?, "+
-		"runner_tag=?, "+
-		"allow_override_branch_in_task=?, "+
-		"allow_parallel_tasks=? "+
-		"where id=? and project_id=?",
-		template.InventoryID,
-		template.RepositoryID,
-		template.EnvironmentID,
-		template.Name,
-		template.Playbook,
-		template.Arguments,
-		template.AllowOverrideArgsInTask,
-		template.Description,
-		template.Type,
-		template.StartVersion,
-		template.BuildTemplateID,
-		template.ViewID,
-		template.Autorun,
-		db.ObjectToJSON(template.SurveyVars),
-		template.SuppressSuccessAlerts,
-		template.App,
-		template.GitBranch,
-		template.TaskParams,
-		template.RunnerTag,
-		template.AllowOverrideBranchInTask,
-		template.AllowParallelTasks,
-
-		template.ID,
-		template.ProjectID,
+func (d *SqlDb) UpdateTemplateEnvironments(projectID int, templateID int, environmentIDs []int) (err error) {
+	_, err = d.exec(
+		"delete from project__template_environment where project_id=? and template_id=?",
+		projectID,
+		templateID,
 	)
 	if err != nil {
-		return err
+		return
 	}
 
-	err = d.UpdateTemplateVaults(template.ProjectID, template.ID, template.Vaults)
+	seen := make(map[int]bool)
+	for _, envID := range environmentIDs {
+		if seen[envID] {
+			continue
+		}
+		seen[envID] = true
 
-	return err
+		_, err = d.exec(
+			"insert into project__template_environment (project_id, template_id, environment_id) values (?, ?, ?)",
+			projectID,
+			templateID,
+			envID,
+		)
+		if err != nil {
+			return
+		}
+	}
+
+	return
 }
+
 func (d *SqlDb) SetTemplateDescription(projectID int, templateID int, description string) (err error) {
 
 	_, err = d.exec("update project__template set "+
@@ -193,6 +268,7 @@ func (d *SqlDb) getTemplates(
 		"pt.name",
 		"pt.description",
 		"pt.playbook",
+		"pt.working_directory",
 		"pt.arguments",
 		"pt.allow_override_args_in_task",
 		"pt.build_template_id",
@@ -207,6 +283,10 @@ func (d *SqlDb) getTemplates(
 		"pt.task_params",
 		"pt.allow_override_branch_in_task",
 		"pt.allow_parallel_tasks",
+		"pt.jwt_params",
+		"pt.executor_image",
+		"pt.suppress_success_alerts",
+		"pt.suppress_error_alerts",
 		"(SELECT `id` FROM `task` WHERE template_id = pt.id ORDER BY `id` DESC LIMIT 1) last_task_id",
 	}
 
@@ -214,7 +294,7 @@ func (d *SqlDb) getTemplates(
 		fields = append(fields, "ptr.permissions permissions")
 	}
 
-	q := squirrel.Select(fields...).From("project__template pt")
+	q := sq.Select(fields...).From("project__template pt")
 
 	if userID != nil {
 		q = q.LeftJoin("project__user pu ON (pu.project_id = pt.project_id AND pu.user_id = ?)", *userID).
@@ -230,9 +310,7 @@ func (d *SqlDb) getTemplates(
 		case db.ViewTypeCustom:
 			q = q.Where("pt.view_id=?", *filter.ViewID)
 		case db.ViewTypeAll:
-			if view.Filter != nil {
-				// TODO: implement filter
-			}
+			// TODO: implement filter
 		}
 	}
 
@@ -298,7 +376,7 @@ func (d *SqlDb) getTemplates(
 	}
 
 	var tasks []db.TaskWithTpl
-	err = d.getTasks(projectID, nil, taskIDs, db.RetrieveQueryParams{}, &tasks)
+	err = d.getTasks(projectID, nil, nil, taskIDs, db.RetrieveQueryParams{}, &tasks)
 
 	if err != nil {
 		return
@@ -338,6 +416,16 @@ func (d *SqlDb) getTemplates(
 			}
 		}
 
+		template.EnvironmentIDs, err = d.GetTemplateEnvironments(projectID, template.ID)
+		if err != nil {
+			return
+		}
+
+		// For backward compatibility
+		if len(template.EnvironmentIDs) > 0 {
+			template.EnvironmentID = template.EnvironmentIDs[0]
+		}
+
 		templates = append(templates, template)
 	}
 
@@ -363,6 +451,37 @@ func (d *SqlDb) GetTemplates(projectID int, filter db.TemplateFilter, params db.
 	return
 }
 
+// GetTemplateByName returns the template of the project with the given name.
+// Template names are not unique per project, so an ambiguous name is rejected
+// instead of silently running one of the matching templates.
+func (d *SqlDb) GetTemplateByName(projectID int, name string) (template db.Template, err error) {
+	var templates []db.Template
+
+	_, err = d.selectAll(
+		&templates,
+		"select * from project__template where project_id=? and name=? limit 2",
+		projectID,
+		name)
+
+	if err != nil {
+		return
+	}
+
+	switch len(templates) {
+	case 0:
+		err = db.ErrNotFound
+		return
+	case 1:
+	default:
+		err = common_errors.NewValidationError("more than one template is named " + name + ", use template_id")
+		return
+	}
+
+	template = templates[0]
+	err = db.FillTemplate(d, &template)
+	return
+}
+
 func (d *SqlDb) GetTemplate(projectID int, templateID int) (template db.Template, err error) {
 	err = d.selectOne(
 		&template,
@@ -379,8 +498,7 @@ func (d *SqlDb) GetTemplate(projectID int, templateID int) (template db.Template
 }
 
 func (d *SqlDb) DeleteTemplate(projectID int, templateID int) error {
-	_, err := d.exec("delete from project__template where project_id=? and id=?", projectID, templateID)
-	return err
+	return requireDeletedRow(d.exec("delete from project__template where project_id=? and id=?", projectID, templateID))
 }
 
 func (d *SqlDb) GetTemplateRefs(projectID int, templateID int) (db.ObjectReferrers, error) {
@@ -389,7 +507,7 @@ func (d *SqlDb) GetTemplateRefs(projectID int, templateID int) (db.ObjectReferre
 
 func (d *SqlDb) GetTemplateRole(projectID int, templateID int, id int) (templateRole db.TemplateRolePerm, err error) {
 
-	query, args, err := squirrel.Select("*").
+	query, args, err := sq.Select("*").
 		From("project__template_role").
 		Where("project_id = ?", projectID).
 		Where("template_id = ?", templateID).
@@ -417,22 +535,31 @@ func (d *SqlDb) GetTemplatePermission(projectID int, templateID int, userID int)
 
 	perm = projectUser.Role.GetPermissions()
 
-	role, err := d.GetProjectOrGlobalRoleBySlug(projectUser.ProjectID, string(projectUser.Role))
+	roleSlug := string(projectUser.Role)
 
-	if errors.Is(err, db.ErrNotFound) {
-		err = nil
-		return
+	// Only custom roles are resolved from the database; built-in roles use their
+	// own slug directly so a same-named custom role cannot shadow them.
+	if !projectUser.Role.IsValid() {
+		var role db.Role
+		role, err = d.GetProjectOrGlobalRoleBySlug(projectUser.ProjectID, string(projectUser.Role))
+
+		if errors.Is(err, db.ErrNotFound) {
+			err = nil
+			return
+		}
+
+		if err != nil {
+			return
+		}
+
+		roleSlug = role.Slug
 	}
 
-	if err != nil {
-		return
-	}
-
-	query, args, err := squirrel.Select("permissions").
+	query, args, err := sq.Select("permissions").
 		From("project__template_role").
 		Where("project_id = ?", projectID).
 		Where("template_id = ?", templateID).
-		Where("role_slug = ?", role.Slug).
+		Where("role_slug = ?", roleSlug).
 		ToSql()
 
 	if err != nil {
@@ -458,7 +585,7 @@ func (d *SqlDb) GetTemplatePermission(projectID int, templateID int, userID int)
 }
 
 func (d *SqlDb) GetTemplateRoles(projectID int, templateID int) (roles []db.TemplateRolePerm, err error) {
-	query, args, err := squirrel.Select("*").
+	query, args, err := sq.Select("*").
 		From("project__template_role").
 		Where("project_id = ?", projectID).
 		Where("template_id = ?", templateID).
@@ -489,8 +616,8 @@ func (d *SqlDb) CreateTemplateRole(role db.TemplateRolePerm) (newRole db.Templat
 	return
 }
 func (d *SqlDb) DeleteTemplateRole(projectID int, templateID int, id int) error {
-	_, err := d.exec("delete from project__template_role where project_id=? and template_id=? and id=?", projectID, templateID, id)
-	return err
+	res, err := d.exec("delete from project__template_role where project_id=? and template_id=? and id=?", projectID, templateID, id)
+	return requireDeletedRow(res, err)
 }
 func (d *SqlDb) UpdateTemplateRole(role db.TemplateRolePerm) error {
 	_, err := d.exec(

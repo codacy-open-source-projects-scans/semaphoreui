@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"reflect"
+	"sort"
+
 	"github.com/semaphoreui/semaphore/api/helpers"
 	"github.com/semaphoreui/semaphore/db"
 	"github.com/semaphoreui/semaphore/pkg/conv"
 	"github.com/semaphoreui/semaphore/util"
-	"net/http"
-	"reflect"
-	"sort"
 )
 
 func validateAppID(str string) error {
@@ -19,9 +20,8 @@ func validateAppID(str string) error {
 
 func appMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		appID, err := helpers.GetStrParam("app_id", w, r)
-		if err != nil {
-			helpers.WriteErrorStatus(w, err.Error(), http.StatusBadRequest)
+		appID, ok := helpers.GetStrParamOrAbort("app_id", w, r)
+		if !ok {
 			return
 		}
 

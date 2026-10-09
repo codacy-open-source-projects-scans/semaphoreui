@@ -4,10 +4,13 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/semaphoreui/semaphore/pkg/common_errors"
 	"github.com/semaphoreui/semaphore/pkg/task_logger"
 
 	log "github.com/sirupsen/logrus"
@@ -27,7 +30,7 @@ func GetParsedTime(t time.Time) time.Time {
 
 func ObjectToJSON(obj any) *string {
 	if obj == nil ||
-		(reflect.ValueOf(obj).Kind() == reflect.Ptr && reflect.ValueOf(obj).IsNil()) ||
+		(reflect.ValueOf(obj).Kind() == reflect.Pointer && reflect.ValueOf(obj).IsNil()) ||
 		(reflect.ValueOf(obj).Kind() == reflect.Slice && reflect.ValueOf(obj).IsZero()) {
 		return nil
 	}
@@ -53,6 +56,12 @@ type RetrieveQueryParams struct {
 	Filter       string
 	Ownership    OwnershipFilter
 	TaskFilter   *TaskFilter
+
+	// BeforeID enables keyset (cursor) pagination for id-ordered lists.
+	// When greater than zero, only rows with primary key id strictly less
+	// than BeforeID are returned. It is an alternative to Offset that does
+	// not get more expensive as the caller paginates deeper.
+	BeforeID int
 }
 
 type ObjectReferrer struct {
@@ -67,6 +76,7 @@ type ObjectReferrers struct {
 	Integrations []ObjectReferrer `json:"integrations"`
 	Schedules    []ObjectReferrer `json:"schedules"`
 	AccessKeys   []ObjectReferrer `json:"access_keys"`
+	HostConfigs  []ObjectReferrer `json:"host_configs"`
 }
 
 type IntegrationReferrers struct {
@@ -79,34 +89,29 @@ type IntegrationExtractorChildReferrers struct {
 }
 
 func containsStr(arr []string, str string) bool {
-	for _, a := range arr {
-		if a == str {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(arr, str)
 }
 
 func (p *RetrieveQueryParams) Validate(props ObjectProps) (res RetrieveQueryParams, err error) {
 
 	if p.Offset > 0 && p.Count <= 0 {
-		err = &ValidationError{"offset cannot be without limit"}
+		err = common_errors.NewValidationError("offset cannot be without limit")
 		return
 	}
 
 	if p.Count < 0 {
-		err = &ValidationError{"count must be positive"}
+		err = common_errors.NewValidationError("count must be positive")
 		return
 	}
 
 	if p.Offset < 0 {
-		err = &ValidationError{"offset must be positive"}
+		err = common_errors.NewValidationError("offset must be positive")
 		return
 	}
 
 	if p.SortBy != "" {
 		if !containsStr(props.SortableColumns, p.SortBy) {
-			err = &ValidationError{"invalid sort column"}
+			err = common_errors.NewValidationError("invalid sort column")
 			return
 		}
 	}
@@ -153,18 +158,8 @@ type ObjectProps struct {
 
 var ErrNotFound = errors.New("no rows in result set")
 var ErrInvalidOperation = errors.New("invalid operation")
-
-type ValidationError struct {
-	Message string
-}
-
-func NewValidationError(message string) *ValidationError {
-	return &ValidationError{Message: message}
-}
-
-func (e *ValidationError) Error() string {
-	return e.Message
-}
+var ErrRunnerAlreadyRegistered = errors.New("runner is already registered")
+var ErrRegistrationTokenExpired = errors.New("registration token expired")
 
 type TaskStatUnit string
 
@@ -190,13 +185,8 @@ type ConnectionManager interface {
 	// Connect connects to the database.
 	// Token parameter used if PermanentConnection returns false.
 	// Token used for debugging of session connections.
-	Connect(token string)
-	Close(token string)
-
-	// PermanentConnection returns true if connection should be kept from start to finish of the app.
-	// This mode is suitable for MySQL and Postgres but not for BoltDB.
-	// For BoltDB we should reconnect for each request because BoltDB support only one connection at time.
-	PermanentConnection() bool
+	Connect()
+	Close()
 }
 
 // MigrationManager handles database migrations
@@ -281,11 +271,15 @@ type TemplateManager interface {
 	CreateTemplate(template Template) (Template, error)
 	UpdateTemplate(template Template) error
 	GetTemplate(projectID int, templateID int) (Template, error)
+	GetTemplateByName(projectID int, name string) (Template, error)
 	DeleteTemplate(projectID int, templateID int) error
 	SetTemplateDescription(projectID int, templateID int, description string) error
 	GetTemplateVaults(projectID int, templateID int) ([]TemplateVault, error)
 	CreateTemplateVault(vault TemplateVault) (TemplateVault, error)
 	UpdateTemplateVaults(projectID int, templateID int, vaults []TemplateVault) error
+
+	GetTemplateEnvironments(projectID int, templateID int) ([]int, error)
+	UpdateTemplateEnvironments(projectID int, templateID int, environmentIDs []int) error
 
 	GetTemplatePermission(projectID int, templateID int, userID int) (ProjectUserPermission, error)
 	GetTemplateRoles(projectID int, templateID int) ([]TemplateRolePerm, error)
@@ -315,6 +309,16 @@ type RepositoryManager interface {
 	DeleteRepository(projectID int, repositoryID int) error
 }
 
+// HostConfigManager handles the per-project credential mappings for ssh hosts
+// and git URLs.
+type HostConfigManager interface {
+	GetHostConfig(projectID int, hostConfigID int) (HostConfig, error)
+	GetHostConfigs(projectID int, params RetrieveQueryParams) ([]HostConfig, error)
+	UpdateHostConfig(hostConfig HostConfig) error
+	CreateHostConfig(hostConfig HostConfig) (HostConfig, error)
+	DeleteHostConfig(projectID int, hostConfigID int) error
+}
+
 // EnvironmentManager handles environment-related operations
 type EnvironmentManager interface {
 	GetEnvironment(projectID int, environmentID int) (Environment, error)
@@ -327,11 +331,51 @@ type EnvironmentManager interface {
 }
 
 type GetAccessKeyOptions struct {
-	Owner           AccessKeyOwner
-	IgnoreOwner     bool
+	// Owner restricts the result to keys of a single owner type.
+	// The zero value is meaningful: it is AccessKeyShared, i.e. plain
+	// project keys created by the user. Because of that, "no owner filter"
+	// cannot be expressed by leaving Owner empty — use IgnoreOwner instead.
+	Owner AccessKeyOwner
+
+	// IgnoreOwner disables the Owner filter entirely, returning keys of
+	// every owner type (shared, environment, variable, vault, task).
+	// Needed by callers that must see all keys regardless of who owns
+	// them, e.g. vault rekeying and secret storage sync cleanup.
+	IgnoreOwner bool
+
 	EnvironmentID   *int
 	StorageID       *int
 	SourceStorageID *int
+	TaskID          *int
+}
+
+// Validate ensures that querying keys of an owned type always includes the
+// ID that scopes them; without it a query could return keys outside the
+// caller's scope.
+func (o GetAccessKeyOptions) Validate() error {
+	if o.IgnoreOwner {
+		return nil
+	}
+
+	var value *int
+	var name string
+
+	switch o.Owner {
+	case AccessKeyVariable, AccessKeyEnvironment:
+		value, name = o.EnvironmentID, "environment_id"
+	case AccessKeySecretStorage:
+		value, name = o.StorageID, "storage_id"
+	case AccessKeyTaskSecret:
+		value, name = o.TaskID, "task_id"
+	default:
+		return nil
+	}
+
+	if value == nil {
+		return fmt.Errorf("%s is required for owner %q", name, o.Owner)
+	}
+
+	return nil
 }
 
 // AccessKeyManager handles access key-related operations
@@ -342,6 +386,16 @@ type AccessKeyManager interface {
 	UpdateAccessKey(accessKey AccessKey) error
 	CreateAccessKey(accessKey AccessKey) (AccessKey, error)
 	DeleteAccessKey(projectID int, accessKeyID int) error
+	// GetTaskAccessKey returns the AccessKeyTaskSecret-owned key of a task
+	// (survey secret variables), or ErrNotFound when the task has none.
+	GetTaskAccessKey(projectID int, taskID int) (AccessKey, error)
+	// DeleteTaskAccessKeys removes all AccessKeyTaskSecret-owned keys of a task.
+	// Deleting for a task without such keys is not an error.
+	DeleteTaskAccessKeys(projectID int, taskID int) error
+	// DeleteExpiredTaskAccessKeys removes all AccessKeyTaskSecret-owned keys
+	// whose expire_at is in the past, across all projects. Idempotent, safe to
+	// run concurrently on several HA nodes.
+	DeleteExpiredTaskAccessKeys() error
 }
 
 // IntegrationManager handles integration-related operations
@@ -389,13 +443,23 @@ type TokenManager interface {
 	CreateAPIToken(token APIToken) (APIToken, error)
 	GetAPIToken(tokenID string) (APIToken, error)
 	ExpireAPIToken(userID int, tokenID string) error
+	GetAPITokensByPrefix(userID int, tokenPrefix string) ([]APIToken, error)
 	DeleteAPIToken(userID int, tokenID string) error
+}
+
+// ExternalIdentityManager handles external identity-related operations
+type ExternalIdentityManager interface {
+	GetExternalIdentity(idType string, provider string, externalUID string) (UserExternalIdentity, error)
+	GetUserExternalIdentities(userID int) ([]UserExternalIdentity, error)
+	CreateExternalIdentity(identity UserExternalIdentity) (UserExternalIdentity, error)
+	DeleteExternalIdentity(userID int, idType string, provider string) error
 }
 
 // TaskManager handles task-related operations
 type TaskManager interface {
 	CreateTask(task Task, maxTasks int) (Task, error)
 	UpdateTask(task Task) error
+	UpdateTaskArtifacts(projectID int, taskID int, artifacts *string) error
 	SetWaitingTasksToStopped(projectID int, templateID int) error
 	GetTemplateTasks(projectID int, templateID int, params RetrieveQueryParams) ([]TaskWithTpl, error)
 	GetProjectTasks(projectID int, params RetrieveQueryParams) ([]TaskWithTpl, error)
@@ -447,17 +511,28 @@ type ViewManager interface {
 // RunnerManager handles runner-related operations
 type RunnerManager interface {
 	GetRunner(projectID int, runnerID int) (Runner, error)
-	GetRunners(projectID int, activeOnly bool, tagFilterMode RunnerTagFilterMode, tag *string) ([]Runner, error)
+	GetRunners(projectID int, activeAndRegisteredOnly bool, tagFilterMode RunnerTagFilterMode, tag *string) ([]Runner, error)
 	DeleteRunner(projectID int, runnerID int) error
 	GetRunnerByToken(token string) (Runner, error)
 	GetGlobalRunner(runnerID int) (Runner, error)
-	GetAllRunners(activeOnly bool, globalOnly bool, tagFilterMode RunnerTagFilterMode, tag *string) ([]Runner, error)
+	GetAllRunners(activeAndRegisteredOnly bool, globalOnly bool, tagFilterMode RunnerTagFilterMode, tag *string) ([]Runner, error)
 	DeleteGlobalRunner(runnerID int) error
 	UpdateRunner(runner Runner) error
 	CreateRunner(runner Runner) (Runner, error)
+	// RegisterRunner finalizes a previously created tokenless ("unregistered")
+	// runner, looked up by the hash of the one-time registration token it presents:
+	// it generates the runner's auth token, stores its public key, activates it and
+	// clears the registration token. It fails if no matching runner exists, the
+	// token has expired, or the runner is already registered.
+	RegisterRunner(registrationTokenHash string, publicKey *string) (Runner, error)
+	// ResetRunnerRegistration moves a runner (back) to the unregistered state: it
+	// clears the auth token, public key and active flag, and stores a new one-time
+	// registration token hash and its expiry.
+	ResetRunnerRegistration(runnerID int, registrationTokenHash string, expiresAt time.Time) error
 	TouchRunner(runner Runner) (err error)
 	ClearRunnerCache(runner Runner) (err error)
 	GetRunnerTags(projectID int) ([]RunnerTag, error)
+	GetGlobalRunnerTags() ([]RunnerTag, error)
 	GetRunnerCount() (int, error)
 }
 
@@ -506,7 +581,7 @@ type RoleRepository interface {
 	GetGlobalRoles() ([]Role, error)
 	UpdateRole(role Role) error
 	CreateRole(role Role) (Role, error)
-	DeleteRole(slug string) error
+	DeleteRole(slug string, projectID *int) error
 }
 
 // Store is the main interface that aggregates all specialized interfaces
@@ -520,11 +595,13 @@ type Store interface {
 	TemplateManager
 	InventoryManager
 	RepositoryManager
+	HostConfigManager
 	EnvironmentManager
 	AccessKeyManager
 	IntegrationManager
 	SessionManager
 	TokenManager
+	ExternalIdentityManager
 	TaskManager
 	ScheduleManager
 	ViewManager
@@ -533,11 +610,12 @@ type Store interface {
 	SecretStorageRepository
 	SecretSyncRepository
 	RoleRepository
+	AuditEventManager
 }
 
 var AccessKeyProps = ObjectProps{
 	TableName:             "access_key",
-	Type:                  reflect.TypeOf(AccessKey{}),
+	Type:                  reflect.TypeFor[AccessKey](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "key_id",
 	SortableColumns:       []string{"name", "type"},
@@ -546,7 +624,7 @@ var AccessKeyProps = ObjectProps{
 
 var IntegrationProps = ObjectProps{
 	TableName:             "project__integration",
-	Type:                  reflect.TypeOf(Integration{}),
+	Type:                  reflect.TypeFor[Integration](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "integration_id",
 	SortableColumns:       []string{"name"},
@@ -555,14 +633,14 @@ var IntegrationProps = ObjectProps{
 
 var TaskParamsProps = ObjectProps{
 	TableName:             "project__task_params",
-	Type:                  reflect.TypeOf(TaskParams{}),
+	Type:                  reflect.TypeFor[TaskParams](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "params_id",
 }
 
 var IntegrationExtractValueProps = ObjectProps{
 	TableName:            "project__integration_extract_value",
-	Type:                 reflect.TypeOf(IntegrationExtractValue{}),
+	Type:                 reflect.TypeFor[IntegrationExtractValue](),
 	PrimaryColumnName:    "id",
 	SortableColumns:      []string{"name"},
 	DefaultSortingColumn: "name",
@@ -570,7 +648,7 @@ var IntegrationExtractValueProps = ObjectProps{
 
 var IntegrationMatcherProps = ObjectProps{
 	TableName:            "project__integration_matcher",
-	Type:                 reflect.TypeOf(IntegrationMatcher{}),
+	Type:                 reflect.TypeFor[IntegrationMatcher](),
 	PrimaryColumnName:    "id",
 	SortableColumns:      []string{"name"},
 	DefaultSortingColumn: "name",
@@ -578,13 +656,13 @@ var IntegrationMatcherProps = ObjectProps{
 
 var IntegrationAliasProps = ObjectProps{
 	TableName:         "project__integration_alias",
-	Type:              reflect.TypeOf(IntegrationAlias{}),
+	Type:              reflect.TypeFor[IntegrationAlias](),
 	PrimaryColumnName: "id",
 }
 
 var EnvironmentProps = ObjectProps{
 	TableName:             "project__environment",
-	Type:                  reflect.TypeOf(Environment{}),
+	Type:                  reflect.TypeFor[Environment](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "environment_id",
 	SortableColumns:       []string{"name"},
@@ -593,7 +671,7 @@ var EnvironmentProps = ObjectProps{
 
 var InventoryProps = ObjectProps{
 	TableName:             "project__inventory",
-	Type:                  reflect.TypeOf(Inventory{}),
+	Type:                  reflect.TypeFor[Inventory](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "inventory_id",
 	SortableColumns:       []string{"name"},
@@ -603,7 +681,7 @@ var InventoryProps = ObjectProps{
 
 var RepositoryProps = ObjectProps{
 	TableName:             "project__repository",
-	Type:                  reflect.TypeOf(Repository{}),
+	Type:                  reflect.TypeFor[Repository](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "repository_id",
 	DefaultSortingColumn:  "name",
@@ -611,22 +689,31 @@ var RepositoryProps = ObjectProps{
 
 var TemplateProps = ObjectProps{
 	TableName:             "project__template",
-	Type:                  reflect.TypeOf(Template{}),
+	Type:                  reflect.TypeFor[Template](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "template_id",
-	SortableColumns:       []string{"name", "playbook", "inventory", "environment", "repository"},
+	SortableColumns:       []string{"name", "playbook", "inventory", "repository"},
+	DefaultSortingColumn:  "name",
+}
+
+var WorkflowTemplateProps = ObjectProps{
+	TableName:             "project__workflow_template",
+	Type:                  reflect.TypeFor[WorkflowTemplate](),
+	PrimaryColumnName:     "id",
+	ReferringColumnSuffix: "workflow_template_id",
+	SortableColumns:       []string{"name"},
 	DefaultSortingColumn:  "name",
 }
 
 var ProjectUserProps = ObjectProps{
 	TableName:         "project__user",
-	Type:              reflect.TypeOf(ProjectUser{}),
+	Type:              reflect.TypeFor[ProjectUser](),
 	PrimaryColumnName: "user_id",
 }
 
 var ProjectInviteProps = ObjectProps{
 	TableName:             "project__invite",
-	Type:                  reflect.TypeOf(ProjectInvite{}),
+	Type:                  reflect.TypeFor[ProjectInvite](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "invite_id",
 	SortableColumns:       []string{"created", "status", "role"},
@@ -635,7 +722,7 @@ var ProjectInviteProps = ObjectProps{
 
 var ProjectProps = ObjectProps{
 	TableName:             "project",
-	Type:                  reflect.TypeOf(Project{}),
+	Type:                  reflect.TypeFor[Project](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "project_id",
 	DefaultSortingColumn:  "name",
@@ -644,7 +731,7 @@ var ProjectProps = ObjectProps{
 
 var ScheduleProps = ObjectProps{
 	TableName:         "project__schedule",
-	Type:              reflect.TypeOf(Schedule{}),
+	Type:              reflect.TypeFor[Schedule](),
 	PrimaryColumnName: "id",
 	Ownerships:        []*ObjectProps{&ProjectProps},
 }
@@ -652,14 +739,14 @@ var ScheduleProps = ObjectProps{
 var SecretStorageProps = ObjectProps{
 	TableName:             "project__secret_storage",
 	ReferringColumnSuffix: "storage_id",
-	Type:                  reflect.TypeOf(SecretStorage{}),
+	Type:                  reflect.TypeFor[SecretStorage](),
 	PrimaryColumnName:     "id",
 	Ownerships:            []*ObjectProps{&ProjectProps},
 }
 
 var RoleProps = ObjectProps{
 	TableName:         "role",
-	Type:              reflect.TypeOf(Role{}),
+	Type:              reflect.TypeFor[Role](),
 	PrimaryColumnName: "slug",
 	IsGlobal:          true,
 	SortableColumns:   []string{"name"},
@@ -667,7 +754,7 @@ var RoleProps = ObjectProps{
 
 var UserProps = ObjectProps{
 	TableName:         "user",
-	Type:              reflect.TypeOf(User{}),
+	Type:              reflect.TypeFor[User](),
 	PrimaryColumnName: "id",
 	IsGlobal:          true,
 	SortableColumns:   []string{"name", "username", "email", "role"},
@@ -675,19 +762,25 @@ var UserProps = ObjectProps{
 
 var SessionProps = ObjectProps{
 	TableName:         "session",
-	Type:              reflect.TypeOf(Session{}),
+	Type:              reflect.TypeFor[Session](),
 	PrimaryColumnName: "id",
 }
 
 var TokenProps = ObjectProps{
 	TableName:         "user__token",
-	Type:              reflect.TypeOf(APIToken{}),
+	Type:              reflect.TypeFor[APIToken](),
+	PrimaryColumnName: "id",
+}
+
+var UserExternalIdentityProps = ObjectProps{
+	TableName:         "user__external_identity",
+	Type:              reflect.TypeFor[UserExternalIdentity](),
 	PrimaryColumnName: "id",
 }
 
 var TaskProps = ObjectProps{
 	TableName:         "task",
-	Type:              reflect.TypeOf(Task{}),
+	Type:              reflect.TypeFor[Task](),
 	PrimaryColumnName: "id",
 	IsGlobal:          true,
 	SortInverted:      true,
@@ -695,29 +788,37 @@ var TaskProps = ObjectProps{
 
 var TaskOutputProps = ObjectProps{
 	TableName: "task__output",
-	Type:      reflect.TypeOf(TaskOutput{}),
+	Type:      reflect.TypeFor[TaskOutput](),
 }
 
 var TaskStageProps = ObjectProps{
 	TableName: "task__stage",
-	Type:      reflect.TypeOf(TaskStage{}),
+	Type:      reflect.TypeFor[TaskStage](),
 }
 
 var TaskStageResultProps = ObjectProps{
 	TableName: "task__stage_result",
-	Type:      reflect.TypeOf(TaskStageResult{}),
+	Type:      reflect.TypeFor[TaskStageResult](),
 }
 
 var ViewProps = ObjectProps{
 	TableName:            "project__view",
-	Type:                 reflect.TypeOf(View{}),
+	Type:                 reflect.TypeFor[View](),
 	PrimaryColumnName:    "id",
 	DefaultSortingColumn: "position",
 }
 
+var HostConfigProps = ObjectProps{
+	TableName:            "project__host_config",
+	Type:                 reflect.TypeFor[HostConfig](),
+	PrimaryColumnName:    "id",
+	SortableColumns:      []string{"name"},
+	DefaultSortingColumn: "name",
+}
+
 var GlobalRunnerProps = ObjectProps{
 	TableName:            "runner",
-	Type:                 reflect.TypeOf(Runner{}),
+	Type:                 reflect.TypeFor[Runner](),
 	PrimaryColumnName:    "id",
 	DefaultSortingColumn: "id",
 	SortInverted:         true,
@@ -726,21 +827,21 @@ var GlobalRunnerProps = ObjectProps{
 
 var OptionProps = ObjectProps{
 	TableName:         "option",
-	Type:              reflect.TypeOf(Option{}),
+	Type:              reflect.TypeFor[Option](),
 	PrimaryColumnName: "key",
 	IsGlobal:          true,
 }
 
 var TemplateVaultProps = ObjectProps{
 	TableName:             "project__template_vault",
-	Type:                  reflect.TypeOf(TemplateVault{}),
+	Type:                  reflect.TypeFor[TemplateVault](),
 	PrimaryColumnName:     "id",
 	ReferringColumnSuffix: "template_id",
 }
 
 var UserTotpProps = ObjectProps{
 	TableName:         "user__totp",
-	Type:              reflect.TypeOf(UserTotp{}),
+	Type:              reflect.TypeFor[UserTotp](),
 	PrimaryColumnName: "id",
 }
 
@@ -751,14 +852,14 @@ func (p ObjectProps) GetReferringFieldsFrom(t reflect.Type) (fields []string, er
 	}
 
 	n := t.NumField()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if !strings.HasSuffix(t.Field(i).Tag.Get("db"), p.ReferringColumnSuffix) {
 			continue
 		}
 		fields = append(fields, t.Field(i).Tag.Get("db"))
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if t.Field(i).Tag != "" || t.Field(i).Type.Kind() != reflect.Struct {
 			continue
 		}
@@ -773,22 +874,40 @@ func (p ObjectProps) GetReferringFieldsFrom(t reflect.Type) (fields []string, er
 	return
 }
 
-func StoreSession(store Store, token string, callback func()) {
-	if !store.PermanentConnection() {
-		store.Connect(token)
-	}
-
-	callback()
-
-	if !store.PermanentConnection() {
-		store.Close(token)
-	}
-}
-
 func ValidateRepository(store Store, repo *Repository) (err error) {
 	_, err = store.GetAccessKey(repo.ProjectID, repo.SSHKeyID)
 
 	return
+}
+
+// ValidateHostConfig resolves the credential in the project of the mapping. The
+// foreign key of ssh_key_id points at access_key without a project condition, so
+// a key of another project would be stored and only fail when a task uses it.
+func ValidateHostConfig(store Store, hostConfig *HostConfig) error {
+	key, err := store.GetAccessKey(hostConfig.ProjectID, hostConfig.SSHKeyID)
+	if err != nil {
+		return err
+	}
+
+	if err = hostConfig.ValidateCredential(key.Type); err != nil {
+		return err
+	}
+
+	// The unique index catches this too, but only as a constraint violation with
+	// nothing a user can act on.
+	existing, err := store.GetHostConfigs(hostConfig.ProjectID, RetrieveQueryParams{})
+	if err != nil {
+		return err
+	}
+
+	for _, other := range existing {
+		if other.ID != hostConfig.ID && other.Type == hostConfig.Type && other.Name == hostConfig.Name {
+			return common_errors.NewValidationError(
+				"a mapping for " + hostConfig.Name + " already exists")
+		}
+	}
+
+	return nil
 }
 
 func ValidateInventory(store Store, inventory *Inventory) (err error) {
