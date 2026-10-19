@@ -246,11 +246,13 @@ type ProjectStore interface {
 	CreateProject(project Project) (Project, error)
 	DeleteProject(projectID int) error
 	UpdateProject(project Project) error
-	GetProjectUsers(projectID int, params RetrieveQueryParams) ([]UserWithProjectRole, error)
-	CreateProjectUser(projectUser ProjectUser) (ProjectUser, error)
+	GetProjectUsers(projectID int, params RetrieveQueryParams) ([]UserWithProjectRoles, error)
+	CreateProjectUser(projectID int, userID int, roleIDs []int) error
 	DeleteProjectUser(projectID int, userID int) error
 	GetProjectUser(projectID int, userID int) (ProjectUser, error)
-	UpdateProjectUser(projectUser ProjectUser) error
+	SetProjectUserRoles(projectID int, userID int, roleIDs []int) error
+	GetProjectMember(projectID int, userID int) (ProjectMember, error)
+	CountProjectOwners(projectID int) (int, error)
 }
 
 type ProjectInviteRepository interface {
@@ -581,7 +583,9 @@ type RoleRepository interface {
 	GetGlobalRoles() ([]Role, error)
 	UpdateRole(role Role) error
 	CreateRole(role Role) (Role, error)
-	DeleteRole(slug string, projectID *int) error
+	DeleteRole(roleID int) error
+	GetRoleAssignments(roleID int) (RoleAssignments, error)
+	DeleteRoleWithAssignments(roleID int, withMappings bool) (RoleAssignments, error)
 }
 
 // Store is the main interface that aggregates all specialized interfaces
@@ -705,12 +709,6 @@ var WorkflowTemplateProps = ObjectProps{
 	DefaultSortingColumn:  "name",
 }
 
-var ProjectUserProps = ObjectProps{
-	TableName:         "project__user",
-	Type:              reflect.TypeFor[ProjectUser](),
-	PrimaryColumnName: "user_id",
-}
-
 var ProjectInviteProps = ObjectProps{
 	TableName:             "project__invite",
 	Type:                  reflect.TypeFor[ProjectInvite](),
@@ -742,14 +740,6 @@ var SecretStorageProps = ObjectProps{
 	Type:                  reflect.TypeFor[SecretStorage](),
 	PrimaryColumnName:     "id",
 	Ownerships:            []*ObjectProps{&ProjectProps},
-}
-
-var RoleProps = ObjectProps{
-	TableName:         "role",
-	Type:              reflect.TypeFor[Role](),
-	PrimaryColumnName: "slug",
-	IsGlobal:          true,
-	SortableColumns:   []string{"name"},
 }
 
 var UserProps = ObjectProps{
@@ -929,6 +919,22 @@ func ValidateInventory(store Store, inventory *Inventory) (err error) {
 
 	if inventory.TemplateID != nil {
 		_, err = store.GetTemplate(inventory.ProjectID, *inventory.TemplateID)
+	}
+
+	if err != nil {
+		return
+	}
+
+	// Only a "file" inventory lives in a repository. The UI keeps the hidden
+	// repository_id when the type is switched to static, and API clients may
+	// send it too — drop it so the inventory is never routed through the
+	// repository path at run time.
+	if inventory.Type != InventoryFile {
+		inventory.RepositoryID = nil
+	}
+
+	if inventory.RepositoryID != nil {
+		_, err = store.GetRepository(inventory.ProjectID, *inventory.RepositoryID)
 	}
 
 	return

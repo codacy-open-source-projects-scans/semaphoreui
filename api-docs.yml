@@ -159,7 +159,27 @@ definitions:
         type: string
       role:
         type: string
-        enum: [owner, manager, task_runner, guest]
+        description: "Role slug when the member has exactly one role, otherwise empty"
+        example: manager
+      roles:
+        type: array
+        items:
+          type: string
+        description: "Slugs of all roles of the member. `role` is set only when this list has one role"
+        example: [manager]
+      mapped_roles:
+        type: array
+        readOnly: true
+        description: Roles from IdP group mappings, present only when the member has some. They cannot be changed through this API.
+        items:
+          type: object
+          properties:
+            role:
+              type: string
+            provider:
+              type: string
+            group:
+              type: string
 
   ProjectInvite:
     type: object
@@ -644,6 +664,7 @@ definitions:
       repository_id:
         type: integer
         minimum: 1
+        description: Repository holding the inventory file. Used only by a "file" inventory; for any other type it is dropped and stored as null.
       type:
         type: string
         enum: [static, static-yaml, file, terraform-workspace]
@@ -666,6 +687,11 @@ definitions:
         type: integer
       repository_id:
         type: integer
+        x-nullable: true
+        description: Repository holding the inventory file. Set only for a "file" inventory, null otherwise.
+      template_id:
+        type: integer
+        x-nullable: true
       type:
         type: string
         enum: [static, static-yaml, file, terraform-workspace]
@@ -844,6 +870,10 @@ definitions:
         example: master
       ssh_key_id:
         type: integer
+      monorepo:
+        type: boolean
+        description: Share one checkout of this repository between all templates instead of cloning it per template. Templates of a monorepo can not have a branch of their own or let tasks override the branch or commit.
+        example: false
   
   Repository:
     type: object
@@ -863,6 +893,10 @@ definitions:
         example: master
       ssh_key_id:
         type: integer
+      monorepo:
+        type: boolean
+        description: Share one checkout of this repository between all templates instead of cloning it per template. Templates of a monorepo can not have a branch of their own or let tasks override the branch or commit.
+        example: false
 
   Task:
     type: object
@@ -894,6 +928,19 @@ definitions:
           - $ref: '#/definitions/TerraformTaskParams'
       limit:
         type: string
+      workflow_run_id:
+        type: integer
+        description: Set by the server when the task is a node of a workflow run. Ignored on create.
+      workflow_node_id:
+        type: integer
+        description: Node of the workflow revision that started the task. Ignored on create.
+      artifacts:
+        type: string
+        description: >
+          Outputs of a workflow task, as a JSON document in a string:
+          {"values": {"<name>": <any JSON value>}, "skipped": {"<name>": "<reason>"}}.
+          Set by the server after the task succeeded with outputs; reasons are sensitive, too_large,
+          invalid_name and limit. Ignored on create.
 
   AnsibleTaskParams:
     type: object
@@ -1445,6 +1492,16 @@ definitions:
         description: Number of seconds to wait before continuing (delay kind only).
       task_params:
         $ref: '#/definitions/TaskPrams'
+      survey_inputs:
+        type: array
+        description: >-
+          Task nodes only. Feeds survey variables of the node's template from the workflow's
+          survey variables (the answers the run was started with). A workflow value reaches a
+          variable only through such a binding, whatever the names. When several sources offer
+          a value for one variable: explicit edge mapping, then workflow variable, then by-name
+          edge delivery, then the node's static value, then the variable's default.
+        items:
+          $ref: "#/definitions/WorkflowNodeSurveyInput"
 
   WorkflowEdge:
     type: object
@@ -1460,6 +1517,44 @@ definitions:
       condition:
         type: string
         enum: [on_success, on_failure, always]
+      input_mode:
+        type: string
+        enum: [by_name, explicit]
+        description: >
+          How the outputs of the source node feed the survey variables of the destination task node.
+          by_name (default) delivers every output whose name equals a non-secret survey variable;
+          explicit delivers only the pairs listed in input_mappings. Allowed only on an edge whose
+          destination is a task node.
+      input_mappings:
+        type: array
+        description: Pairs delivered in explicit mode. An empty list means the edge passes nothing.
+        items:
+          $ref: "#/definitions/WorkflowInputMapping"
+
+  WorkflowNodeSurveyInput:
+    type: object
+    required:
+      - var
+      - workflow_var
+    properties:
+      var:
+        type: string
+        description: Non-secret survey variable of the node's template.
+      workflow_var:
+        type: string
+        description: Non-secret survey variable of the workflow whose value the run collected.
+
+  WorkflowInputMapping:
+    type: object
+    required: [var, key]
+    properties:
+      var:
+        type: string
+        description: Name of a non-secret survey variable of the destination template.
+      key:
+        type: string
+        description: Name of a top-level output of the source node.
+        pattern: '^[A-Za-z_][A-Za-z0-9_-]*$'
 
   WorkflowTemplate:
     type: object
@@ -1478,6 +1573,14 @@ definitions:
       revision:
         type: integer
         description: Ordinal of that revision within the workflow (read-only).
+      survey_vars:
+        type: array
+        description: >-
+          Survey asked when a run is started (the same shape as a template's survey; a secret
+          type is rejected). Stored with the graph revision, so every run knows the survey it
+          answered.
+        items:
+          $ref: "#/definitions/TemplateSurveyVar"
       nodes:
         type: array
         items:
@@ -1486,6 +1589,18 @@ definitions:
         type: array
         items:
           $ref: "#/definitions/WorkflowEdge"
+
+  WorkflowRunRequest:
+    type: object
+    description: >-
+      Body of "Run workflow"; optional. The answers to the workflow's survey. The server applies
+      the survey defaults, rejects the start with a validation error when a required variable has
+      no value or a value does not fit its type, and drops keys that are not survey variables.
+    properties:
+      environment:
+        type: object
+        description: Survey variable name → value (a select variable takes a list of strings).
+        additionalProperties: true
 
   WorkflowRun:
     type: object
@@ -1502,6 +1617,12 @@ definitions:
       status:
         type: string
         enum: [running, success, failed, stopped, approval]
+      environment:
+        type: object
+        description: >-
+          Survey answers the run was started with, after defaults and type checks (read-only).
+          Absent for a workflow without a survey. Never holds a secret.
+        additionalProperties: true
       start:
         type: string
         format: date-time
@@ -1583,6 +1704,11 @@ definitions:
       has_runs:
         type: boolean
         description: At least one run pins this revision, so it survives later saves.
+      survey_vars:
+        type: array
+        description: Survey of this revision (see WorkflowTemplate.survey_vars).
+        items:
+          $ref: "#/definitions/TemplateSurveyVar"
 
   WorkflowApprovalResolveRequest:
     type: object
@@ -2351,7 +2477,13 @@ paths:
             properties:
               role:
                 type: string
+                description: "Role slug when the user has exactly one role, otherwise empty"
                 example: owner
+              roles:
+                type: array
+                items:
+                  type: string
+                example: [owner]
               permissions:
                 type: number
                 example: 0
@@ -2418,8 +2550,13 @@ paths:
                 minimum: 2
               role:
                 type: string
-                enum: [owner, manager, task_runner, guest]
-                example: owner
+                description: "Role slug: a built-in role (owner, manager, task_runner, guest) or a custom role"
+                example: manager
+              roles:
+                type: array
+                items:
+                  type: string
+                description: "Several role slugs. Send either role or roles"
       responses:
         204:
           description: User added
@@ -2444,9 +2581,14 @@ paths:
             properties:
               role:
                 type: string
-                enum: [owner, manager, task_runner, guest]
-                example: owner
-      summary: Update user role
+                description: "Role slug: a built-in role (owner, manager, task_runner, guest) or a custom role"
+                example: manager
+              roles:
+                type: array
+                items:
+                  type: string
+                description: "Several role slugs. Send either role or roles"
+      summary: Update user roles
       tags:
         - project
       responses:
@@ -3434,6 +3576,12 @@ paths:
       tags:
         - workflow
       summary: Run workflow
+      parameters:
+        - name: Workflow run
+          in: body
+          required: false
+          schema:
+            $ref: "#/definitions/WorkflowRunRequest"
       responses:
         201:
           description: workflow run created
@@ -3496,9 +3644,13 @@ paths:
       tags:
         - workflow
       summary: Get merged workflow run artifacts
+      description: >
+        The output values of every successful task of the run merged into one object, later tasks
+        overriding earlier ones. Meant for debugging; the outputs of each node are in the
+        artifacts field of its task in the run details.
       responses:
         200:
-          description: merged artifacts
+          description: merged output values
           schema:
             type: object
             additionalProperties: true
